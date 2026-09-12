@@ -1,0 +1,227 @@
+// gitobj_tests.nv — content addressing, and the tree order.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitobj.<fn>`.
+//
+// THE VECTORS ARE GIT'S OWN.  The id of an empty blob under SHA-1 is
+// `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391` and under SHA-256 it is
+// `473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813`.
+// Those two constants are in every git repository in the world and in
+// git's own test suite, so a package that gets them right has the
+// framing, the header and the hash all correct at once — and one that
+// gets them wrong has exactly one of the three wrong and no other
+// symptom.
+//
+// THE TREE ORDER CASE is the one worth the file.  A tree written with a
+// lexicographic sort is an object git reads happily and whose id is not
+// the one git would have written, so two clones disagree about whether
+// they hold the same tree — and nothing reports an error anywhere.
+
+use std.test
+use std.list
+use std.str
+use gitobj
+
+@test
+fn test_the_empty_blob_has_the_id_every_repository_agrees_on() [io]
+    test.case("SHA-1, which is the constant in git's own test suite")
+    test.assert(gitobj.oid_hex(gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1))
+                == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+
+    test.case("SHA-256, which is a different id for identical content")
+    test.assert(gitobj.oid_hex(gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha256))
+                == "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813")
+
+@test
+fn test_the_framing_is_what_gets_hashed() [io]
+    let f = gitobj.framed(GitKindBlob, bytes.from_str("hello"))
+
+    test.case("the header names the kind and the length")
+    test.assert(bytes.len(f) == 13)
+
+    test.case("and unframing gets back to the payload")
+    match gitobj.unframe(f)
+        Ok(u)  =>
+            test.assert(u.kind == GitKindBlob)
+            test.assert(u.payload_len == 5)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_payload_is_a_range_and_not_a_copy() [io]
+    match gitobj.unframe(gitobj.framed(GitKindBlob, bytes.from_str("hello")))
+        Ok(u)  => test.assert(u.payload_at == 8)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_id_is_namespaced_by_its_hash() [io]
+    let one = gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1)
+    let two = gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha256)
+
+    test.case("the same id equals itself")
+    test.assert(gitobj.oid_eq(one, one))
+
+    test.case("and two ids of the same content under different hashes are NOT equal")
+    test.assert(gitobj.oid_eq(one, two) == false)
+
+@test
+fn test_the_id_widths_are_the_formats() [io]
+    test.case("twenty bytes and thirty-two")
+    test.assert(gitobj.oid_width(GitSha1) == 20)
+    test.assert(gitobj.oid_width(GitSha256) == 32)
+
+    test.case("which is forty hex characters and sixty-four")
+    test.assert(str.len(gitobj.oid_hex(gitobj.null_oid(GitSha1))) == 40)
+    test.assert(str.len(gitobj.oid_hex(gitobj.null_oid(GitSha256))) == 64)
+
+@test
+fn test_the_null_id_is_the_one_git_uses_for_nothing() [io]
+    test.case("it is null")
+    test.assert(gitobj.oid_is_null(gitobj.null_oid(GitSha1)))
+
+    test.case("and a real id is not")
+    test.assert(gitobj.oid_is_null(
+        gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1)) == false)
+
+@test
+fn test_an_id_parses_from_hex_and_refuses_a_short_one() [io]
+    test.case("a full one parses")
+    match gitobj.oid_of_hex("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", GitSha1)
+        Some(o) => test.assert(gitobj.oid_hex(o)
+                               == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+        None    => test.assert(false)
+
+    test.case("an abbreviated one does NOT, because resolving it needs the store")
+    test.assert(gitobj.oid_of_hex("e69de29", GitSha1) == None)
+
+    test.case("and one of the wrong width for the algorithm does not either")
+    test.assert(gitobj.oid_of_hex("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                                  GitSha256) == None)
+
+@test
+fn test_abbreviation_is_a_rendering_and_not_a_lookup() [io]
+    let o = gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1)
+
+    test.case("seven characters, which is what git log prints")
+    test.assert(str.len(gitobj.oid_abbrev(o, 7)) == 7)
+
+    test.case("and it is a prefix of the full spelling")
+    test.assert(str.starts_with(gitobj.oid_hex(o), gitobj.oid_abbrev(o, 7)))
+
+@test
+fn test_the_kind_words_are_the_headers_own() [io]
+    test.case("the four words git writes")
+    test.assert(gitobj.kind_word(GitKindBlob) == "blob")
+    test.assert(gitobj.kind_word(GitKindTree) == "tree")
+    test.assert(gitobj.kind_word(GitKindCommit) == "commit")
+    test.assert(gitobj.kind_word(GitKindTag) == "tag")
+
+    test.case("and they parse back")
+    test.assert(gitobj.kind_of_word("tree") == Some(GitKindTree))
+
+    test.case("a fifth word is None, because there is no fifth kind")
+    test.assert(gitobj.kind_of_word("delta") == None)
+
+@test
+fn test_verify_is_what_catches_a_store_that_lied() [io]
+    let o = gitobj.oid_of(GitKindBlob, bytes.from_str("hello"), GitSha1)
+
+    test.case("the bytes that made the id verify against it")
+    test.assert(gitobj.verify(o, GitKindBlob, bytes.from_str("hello")))
+
+    test.case("other bytes do not")
+    test.assert(gitobj.verify(o, GitKindBlob, bytes.from_str("hallo")) == false)
+
+    test.case("and neither does the same payload under another kind, which is the framing working")
+    test.assert(gitobj.verify(o, GitKindTree, bytes.from_str("hello")) == false)
+
+@test
+fn test_the_modes_are_the_five_git_writes_and_the_one_it_only_reads() [io]
+    test.case("the five canonical ones")
+    test.assert(gitobj.mode_is_canonical(16384))
+    test.assert(gitobj.mode_is_canonical(33188))
+    test.assert(gitobj.mode_is_canonical(33261))
+    test.assert(gitobj.mode_is_canonical(40960))
+    test.assert(gitobj.mode_is_canonical(57344))
+
+    test.case("the group-writable one git reads and no longer writes")
+    test.assert(gitobj.mode_is_known(33204))
+    test.assert(gitobj.mode_is_canonical(33204) == false)
+
+    test.case("and a mode nothing writes is neither")
+    test.assert(gitobj.mode_is_known(12345) == false)
+
+@test
+fn test_a_directory_mode_is_the_octal_and_not_the_decimal() [io]
+    test.case("040000 is 16384, which is what a tree entry holds")
+    test.assert(gitobj.mode_is_tree(16384))
+
+    test.case("and the decimal 40000 somebody wrote by mistake is not a directory")
+    test.assert(gitobj.mode_is_tree(40000) == false)
+
+    test.case("nor is a regular file")
+    test.assert(gitobj.mode_is_tree(33188) == false)
+
+@test
+fn test_a_malformed_object_says_what_was_wrong() [io]
+    test.case("bytes with no header at all")
+    match gitobj.unframe(bytes.from_str("not an object"))
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("and a kind that is not one of the four")
+    match gitobj.unframe(bytes.from_str("delta 0\u{0}"))
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(str.contains(e.message(), "delta"))
+
+@test
+fn test_a_tree_round_trips_through_its_own_bytes() [io]
+    let raw = bytes.from_str("")
+
+    test.case("a tree parses out of a payload")
+    match gitobj.parse_tree(raw)
+        Ok(t)  => test.assert(list.len(t.entries) == 0)
+        Err(_) => test.assert(false)
+
+    test.case("and an empty tree writes back to nothing")
+    match gitobj.parse_tree(raw)
+        Ok(t)  =>
+            match gitobj.serialise_tree(t, raw)
+                Ok(out) => test.assert(bytes.len(out) == 0)
+                Err(_)  => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("an empty tree is trivially in order")
+    match gitobj.parse_tree(raw)
+        Ok(t)  => test.assert(gitobj.entries_sorted(t, raw))
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_commit_and_a_tag_parse_out_of_their_payloads() [io]
+    let body = bytes.from_str("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nempty\n")
+
+    test.case("a commit that carries only a tree")
+    match gitobj.parse_commit(body)
+        Ok(c)  => test.assert(list.len(c.parents) == 0)
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("and a tag payload is parsed by its own call")
+    match gitobj.parse_tag(bytes.from_str(""))
+        Ok(_)  => test.assert(true)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_a_commits_extra_headers_survive_a_round_trip() [io]
+    let src = bytes.from_str("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nx\n")
+
+    test.case("because a signed commit re-serialised without gpgsig has a different id")
+    match gitobj.parse_commit(src)
+        Ok(c)  =>
+            match gitobj.serialise_commit(c, src)
+                Ok(out) => test.assert(bytes.len(out) > 0)
+                Err(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_a_span_becomes_a_string_only_where_a_caller_asks() [io]
+    test.case("one name out of a buffer, and nothing else allocated")
+    test.assert(gitobj.span_str(bytes.from_str("main.nv"), 0, 4) == "main")

@@ -1,0 +1,460 @@
+// gitrepo.nv — the half that touches the disk.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[fs]` AND NOTHING ELSE.  Every row in this module is exactly `[fs]`:
+// opening a directory, reading a file, writing one.  The four modules
+// this one calls into — `gitobj`, `gitpack`, `gitref`, `gitindex` —
+// declare nothing at all, which is the split this package is built
+// around and the argument for the `git-core-nv` row the README names.
+//
+// A REPOSITORY IS FOUND, NOT CONFIGURED.  `discover` walks upward from a
+// directory looking for `.git`, which is what every git command does and
+// what a tool that took a path as a flag makes its users type.  It stops
+// at a filesystem boundary and at `$GIT_CEILING_DIRECTORIES`, because
+// walking up out of a home directory into a shared mount is how a tool
+// ends up reading somebody else's repository.
+//
+// `.git` IS NOT ALWAYS A DIRECTORY.  In a worktree and in a submodule it
+// is a FILE containing `gitdir: <path>`, and a tool that assumed a
+// directory works everywhere except in exactly the two places this
+// project itself uses.  `discover` follows it.
+//
+// AN OBJECT MAY BE ANYWHERE, AND THE ORDER MATTERS.  Loose first, then
+// each pack, then the alternates in `objects/info/alternates` — and the
+// alternates are how a `--reference` clone and a shared cache work, so
+// a reader that skipped them reports most of a repository missing.
+// `read_object` walks all three.
+//
+// NOTHING IS CACHED ACROSS CALLS.  `GitRepo` holds paths and the parsed
+// pack indices, and `open` is where that work is done — once, by the
+// caller, at a moment it chooses.  A reader that re-read `packed-refs`
+// per lookup is the shape that makes a `log` walk quadratic.
+
+use gitindex
+use gitref
+
+// An open repository.
+//
+// Paths rather than handles, because a handle held across a `log` walk
+// of a hundred thousand commits is a descriptor held for minutes, and
+// because a caller may want to hand these paths to something else.
+pub struct GitRepo
+    // The `.git` directory itself, after following a `gitdir:` file.
+    git_dir: Str
+    // The directory the files live in.  Empty for a bare repository,
+    // which is what a server has and what `novo pkg add`'s cache
+    // clones.
+    work_dir: Str
+    // `refs/heads/…`, or empty in a detached or unborn state.
+    algo: GitHashAlgo
+    // The `.idx` files found under `objects/pack`, parsed once.
+    packs: [GitPackFile]
+    // The directories in `objects/info/alternates`, resolved.
+    alternates: [Str]
+    // The repository is bare: no working tree, no index.
+    is_bare: Bool
+
+// One pack and its index, located.
+pub struct GitPackFile
+    pack_path: Str
+    index_path: Str
+    index: GitPackIndex
+
+// Why a repository could not be opened or read.
+//
+// Distinct from `GitObjFault` and `GitPackFault` on purpose: those say
+// the BYTES are wrong, this says the machine could not produce them.
+// A caller retries one and reports the other.
+pub enum GitRepoFault
+    // No `.git` anywhere up from here.
+    GitNoRepository(from: Str)
+    // A `.git` file whose `gitdir:` line points at nothing.
+    GitBadGitdirFile(path: Str, points_to: Str)
+    // A path could not be read.  `cause` is the standard library's.
+    GitReadFailed(path: Str, cause: IoError)
+    // A path could not be written.
+    GitWriteFailed(path: Str, cause: IoError)
+    // The object is in none of the loose store, the packs or the
+    // alternates.
+    GitObjectNotFound(oid: Str)
+    // An abbreviated id several objects share.  `count` is how many, so
+    // the message can say "4 objects begin 4bf92f3" rather than
+    // "ambiguous".
+    GitAmbiguousOid(prefix: Str, count: Int)
+    // An `objects/info/alternates` entry that is not a directory, or
+    // that points back into this repository.
+    GitBadAlternate(path: Str)
+    // The bytes came back and were not the object.  The pass-through
+    // for the two pure modules' faults, so a caller has ONE error type
+    // to handle at the `[fs]` boundary.
+    GitCorruptObject(oid: Str, cause: GitObjFault)
+    // A pack refused to yield an object.
+    GitCorruptPack(path: Str, cause: GitPackFault)
+
+// The standard `Error` implementation.
+impl Error for GitRepoFault
+    // One line: what could not be read or found, and where.
+    //
+    // A missing object names the id and an ambiguous prefix names the
+    // count, because both are what a person needs to type the next
+    // command.
+    fn message(self) -> Str
+        todo("git-nv.gitrepo.GitRepoFault.message")
+
+// Find the repository containing this directory.
+//
+// Walks upward, follows a `gitdir:` file, stops at a filesystem
+// boundary.  Answers the `.git` path; `open` is the call that reads it.
+//
+// ```novo
+// use gitrepo
+//
+// fn find(here: Str) -> Result<Str, GitRepoFault> [fs]
+//     gitrepo.discover(here)
+//
+// fn main() [io]
+//     println("where the repository is")
+// ```
+pub fn discover(from: Str) -> Result<Str, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.discover")
+
+// Open the repository at this `.git` path.
+//
+// Reads the object format, locates the packs and parses their indices,
+// resolves the alternates.  Everything a reader needs in order not to
+// touch the disk again until it wants an object.
+//
+// ```novo
+// use gitrepo
+//
+// fn load(git_dir: Str) -> Result<GitRepo, GitRepoFault> [fs]
+//     gitrepo.open(git_dir)
+//
+// fn main() [io]
+//     println("a repository, open")
+// ```
+pub fn open(git_dir: Str) -> Result<GitRepo, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.open")
+
+// Discover and open in one call.
+//
+// What a tool's first line is.
+//
+// ```novo
+// use gitrepo
+//
+// fn here() -> Result<GitRepo, GitRepoFault> [fs]
+//     gitrepo.open_from(".")
+//
+// fn main() [io]
+//     println("the repository this program is standing in")
+// ```
+pub fn open_from(from: Str) -> Result<GitRepo, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.open_from")
+
+// Read one object: its kind and its payload.
+//
+// Loose, then each pack, then the alternates — and it does the delta
+// chain, supplying bases out of the same store, so a caller never sees
+// `gitpack`'s request loop unless it wants to.
+//
+// ```novo
+// use gitrepo
+//
+// fn load(r: GitRepo, o: GitOid) -> Result<GitObject, GitRepoFault> [fs]
+//     gitrepo.read_object(r, o)
+//
+// fn main() [io]
+//     println("an object, from wherever it is")
+// ```
+pub fn read_object(r: GitRepo, o: GitOid) -> Result<GitObject, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.read_object")
+
+// An object as it came out of the store.
+pub struct GitObject
+    kind: GitObjKind
+    payload: Bytes
+
+// The kind and size of an object, without its payload.
+//
+// `git cat-file -t` and `-s`, and the reason it is a separate call: a
+// tool deciding whether to load a 200 MB blob needs the size first, and
+// a loose object's size is in its header while a packed one's is in the
+// pack entry — so the cheap answer exists and a caller should be able to
+// ask for it.
+//
+// ```novo
+// use gitrepo
+//
+// fn about(r: GitRepo, o: GitOid) -> Result<(GitObjKind, Int), GitRepoFault> [fs]
+//     gitrepo.object_info(r, o)
+//
+// fn main() [io]
+//     println("what an object is, without reading it")
+// ```
+pub fn object_info(r: GitRepo, o: GitOid) -> Result<(GitObjKind, Int), GitRepoFault> [fs]
+    todo("git-nv.gitrepo.object_info")
+
+// Is this object in the store at all?
+//
+// ```novo
+// use gitrepo
+//
+// fn here(r: GitRepo, o: GitOid) -> Bool [fs]
+//     gitrepo.has_object(r, o)
+//
+// fn main() [io]
+//     println("whether an object is present")
+// ```
+pub fn has_object(r: GitRepo, o: GitOid) -> Bool [fs]
+    todo("git-nv.gitrepo.has_object")
+
+// Write an object into the loose store, answering its id.
+//
+// Writes through a temporary file and renames, which is what makes a
+// half-written object impossible: a reader that met one would see a
+// zlib stream that inflates to fewer bytes than its header claims and
+// would report the repository corrupt.
+//
+// An object already present is not rewritten — the store is
+// content-addressed, so the bytes cannot differ.
+//
+// ```novo
+// use gitrepo
+//
+// fn store(r: GitRepo, payload: Bytes) -> Result<GitOid, GitRepoFault> [fs]
+//     gitrepo.write_object(r, GitKindBlob, payload)
+//
+// fn main() [io]
+//     println("an object, stored")
+// ```
+pub fn write_object(r: GitRepo, kind: GitObjKind,
+                    payload: Bytes) -> Result<GitOid, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.write_object")
+
+// Every ref the repository has, loose and packed, merged.
+//
+// `gitref.merge_sources` over both sources, with the tombstone rule.
+//
+// ```novo
+// use gitrepo
+//
+// fn all(r: GitRepo) -> Result<[GitRef], GitRepoFault> [fs]
+//     gitrepo.refs(r)
+//
+// fn main() [io]
+//     println("every ref, once each")
+// ```
+pub fn refs(r: GitRepo) -> Result<[GitRef], GitRepoFault> [fs]
+    todo("git-nv.gitrepo.refs")
+
+// The object a ref names, following symbolic refs.
+//
+// `None` for an unborn branch, which is what a fresh repository's
+// `HEAD` is — and the case every tool that assumed `HEAD` resolves gets
+// wrong on an empty repository.
+//
+// ```novo
+// use gitrepo
+//
+// fn at(r: GitRepo, name: Str) -> Result<?GitOid, GitRepoFault> [fs]
+//     gitrepo.resolve_ref(r, name)
+//
+// fn main() [io]
+//     println("the commit a ref names")
+// ```
+pub fn resolve_ref(r: GitRepo, name: Str) -> Result<?GitOid, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.resolve_ref")
+
+// Point a ref at an object.
+//
+// Refuses a name `gitref.check_ref_format` rejects, BEFORE touching the
+// filesystem — which is the path-traversal guard, and it is here rather
+// than left to the caller because the caller that needs it most is the
+// one taking a name from a server.
+//
+// ```novo
+// use gitrepo
+//
+// fn move_to(r: GitRepo, o: GitOid) -> Result<Unit, GitRepoFault> [fs]
+//     gitrepo.write_ref(r, "refs/heads/main", o)
+//
+// fn main() [io]
+//     println("a ref, moved")
+// ```
+pub fn write_ref(r: GitRepo, name: Str, o: GitOid) -> Result<Unit, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.write_ref")
+
+// The repository's index.
+//
+// Answers both the parsed index and the bytes it was parsed from,
+// because every path in it is a range into those bytes and a caller
+// that dropped them could not read a single name.
+//
+// ```novo
+// use gitrepo
+//
+// fn staged(r: GitRepo) -> Result<GitLoadedIndex, GitRepoFault> [fs]
+//     gitrepo.read_index(r)
+//
+// fn main() [io]
+//     println("what is staged")
+// ```
+pub fn read_index(r: GitRepo) -> Result<GitLoadedIndex, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.read_index")
+
+// An index and the bytes its paths point into.
+pub struct GitLoadedIndex
+    index: GitIndex
+    bytes: Bytes
+    // The index file's own mtime, which `gitindex.is_racy` needs.
+    mtime_seconds: Int
+    mtime_nanos: Int
+
+// The full id an abbreviation means.
+//
+// Searches the loose store and every pack index.  Refuses with
+// `GitAmbiguousOid` and the COUNT when several match, because a person
+// who typed seven characters wants to be told to type eight, not that
+// something was ambiguous.
+//
+// ```novo
+// use gitrepo
+//
+// fn full(r: GitRepo) -> Result<GitOid, GitRepoFault> [fs]
+//     gitrepo.resolve_abbrev(r, "4bf92f3")
+//
+// fn main() [io]
+//     println("the object an abbreviated id means")
+// ```
+pub fn resolve_abbrev(r: GitRepo, prefix: Str) -> Result<GitOid, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.resolve_abbrev")
+
+// The shortest prefix of this id that names it uniquely here.
+//
+// What `git log`'s seven-character ids actually are: seven is a default
+// that git widens as a repository grows, and a tool that hard-coded it
+// prints ambiguous ids in a large repository.
+//
+// ```novo
+// use gitrepo
+//
+// fn short(r: GitRepo, o: GitOid) -> Result<Str, GitRepoFault> [fs]
+//     gitrepo.shortest_unique(r, o, 7)
+//
+// fn main() [io]
+//     println("an id, as short as it can safely be")
+// ```
+pub fn shortest_unique(r: GitRepo, o: GitOid, minimum: Int) -> Result<Str, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.shortest_unique")
+
+// The commit `HEAD` is at, and the branch it is on.
+//
+// The pair, because a tool needs both and asking twice reads `HEAD`
+// twice.  The branch is empty in a detached head, and the commit is
+// `None` on an unborn branch — the two states a tool has to tell apart
+// and usually does not.
+//
+// ```novo
+// use gitrepo
+//
+// fn where_we_are(r: GitRepo) -> Result<GitHead, GitRepoFault> [fs]
+//     gitrepo.head(r)
+//
+// fn main() [io]
+//     println("what HEAD is")
+// ```
+pub fn head(r: GitRepo) -> Result<GitHead, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.head")
+
+// Where `HEAD` is.
+pub struct GitHead
+    // `refs/heads/main`, or empty when detached.
+    branch: Str
+    // `None` on an unborn branch.
+    commit: ?GitOid
+    detached: Bool
+
+// Walk the commit history from these tips.
+//
+// Answers a page of commits in the order `git log` would: reverse
+// chronological, with the parents of a merge interleaved by commit
+// time.  `after` continues a walk, so a tool paginating a history holds
+// one cursor and not the whole graph.
+//
+// The clock is the COMMITS' own, so this stays `[fs]` and nothing here
+// reads a clock.
+//
+// ```novo
+// use gitrepo
+//
+// fn history(r: GitRepo, tip: GitOid) -> Result<GitLogPage, GitRepoFault> [fs]
+//     gitrepo.log(r, [tip], 50, None)
+//
+// fn main() [io]
+//     println("a page of history")
+// ```
+pub fn log(r: GitRepo, tips: [GitOid], limit: Int,
+           after: ?GitLogCursor) -> Result<GitLogPage, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.log")
+
+// A page of history, and where to continue.
+pub struct GitLogPage
+    commits: [GitLogEntry]
+    // `None` when the walk reached the roots.
+    next: ?GitLogCursor
+
+// One commit in a walk: its id, and the parsed commit with the bytes
+// its spans point into.
+pub struct GitLogEntry
+    oid: GitOid
+    commit: GitCommit
+    bytes: Bytes
+
+// Where a history walk had got to.
+//
+// The frontier, as the commits still to visit — opaque to a caller and
+// carried back into `log`.
+pub struct GitLogCursor
+    frontier: [GitOid]
+    seen: [GitOid]
+
+// The tree an object resolves to, following a tag and a commit.
+//
+// `HEAD^{tree}` in one call.  Published because "the tree of whatever
+// this names" is what every checkout, diff and archive starts with, and
+// writing the two unwrapping steps by hand is where a tool forgets that
+// an annotated tag can point at another tag.
+//
+// ```novo
+// use gitrepo
+//
+// fn tree(r: GitRepo, o: GitOid) -> Result<GitOid, GitRepoFault> [fs]
+//     gitrepo.peel_to_tree(r, o)
+//
+// fn main() [io]
+//     println("the tree something names")
+// ```
+pub fn peel_to_tree(r: GitRepo, o: GitOid) -> Result<GitOid, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.peel_to_tree")
+
+// The object at a path inside a tree.
+//
+// `read_object` plus a walk down the directories, which is the call a
+// tool that wants one file out of a commit makes — and doing it by hand
+// means loading every intermediate tree and forgetting that a path
+// component may be a submodule.
+//
+// ```novo
+// use gitrepo
+//
+// fn at(r: GitRepo, tree: GitOid) -> Result<?GitTreeEntry, GitRepoFault> [fs]
+//     gitrepo.entry_at_path(r, tree, "src/main.nv")
+//
+// fn main() [io]
+//     println("one file, out of a commit")
+// ```
+pub fn entry_at_path(r: GitRepo, tree: GitOid,
+                     path: Str) -> Result<?GitTreeEntry, GitRepoFault> [fs]
+    todo("git-nv.gitrepo.entry_at_path")

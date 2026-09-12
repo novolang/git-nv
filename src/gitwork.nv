@@ -1,0 +1,417 @@
+// gitwork.nv — the four questions a tool actually asks: what changed,
+// what happened, how, and who.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// STATUS IS THREE COMPARISONS AND NOT ONE.  `git status` answers two
+// independent questions per path — HEAD against the index (what is
+// staged) and the index against the working tree (what is not) — and a
+// path can be in a different state in each: staged as modified and then
+// modified again, staged as added and then deleted.  A model with one
+// state per path cannot represent that, and every tool built on one
+// eventually prints a line that is simply false.  `GitStatusEntry`
+// carries both.
+//
+// UNTRACKED IS A THIRD THING, and it is the expensive one: finding it
+// means walking the whole working tree, and the walk is what makes
+// `status` slow in a repository with a large build directory.  So it is
+// a separate call with its own ignore rules, and a tool that does not
+// need it does not pay for it.
+//
+// THE IGNORE RULES ARE NOT GLOB-NV'S, AND THE README SAYS SO.  Git's
+// `.gitignore` has three things a plain glob does not: a `!` negation
+// whose ORDER matters, a rule that a pattern with no `/` matches at any
+// depth while one with a `/` is anchored, and a directory exclusion that
+// stops the walk so a negation inside it cannot re-include anything.
+// `gitignore_matches` is that, and it takes the stack of files from the
+// root down because the last matching rule in the deepest file wins.
+//
+// DIFF IS diff-nv's, AND ONLY THE RENAME DETECTION IS HERE.  Tokenising
+// two blobs and answering hunks is `diffscript.diff`; what git adds is
+// deciding that a deleted path and an added path are one renamed file,
+// which is arithmetic over the scripts rather than a different
+// algorithm.
+//
+// BLAME IS A WALK, NOT A FUNCTION.  Answering "who wrote line 40" means
+// diffing the file against each parent until the line stops moving, and
+// on a long history that is hundreds of object reads.  `blame` takes a
+// budget and answers what it got, because a blame that ran unbounded on
+// a file with ten thousand commits is a tool that appears to hang.
+
+// What happened to one path, in both places.
+//
+// `staged` is HEAD against the index; `unstaged` is the index against
+// the working tree.  Both, always, because a path is routinely in two
+// different states at once.
+pub struct GitStatusEntry
+    path: Str
+    staged: GitChange
+    unstaged: GitChange
+    // Set when the index holds more than one stage for this path.
+    conflicted: Bool
+    // For a rename, the path it came from; empty otherwise.
+    from_path: Str
+
+// What one comparison found.
+pub enum GitChange
+    GitUnchanged
+    GitAdded
+    GitModified
+    GitDeleted
+    // Only ever `staged`: a rename is a fact about HEAD and the index,
+    // and the working tree has no way to express one.
+    GitRenamed(similarity: Int)
+    // The type changed — a file became a symlink, or a directory became
+    // a submodule.  Distinct from modified because a checkout has to
+    // unlink before it writes, and a tool that treated it as a
+    // modification writes a file over a directory.
+    GitTypeChanged
+
+// How hard to look for renames.
+//
+// `similarity_threshold` is git's own `-M`: the percentage of a file
+// that has to survive for a delete and an add to be called a rename.
+// 50 is git's default.  `rename_limit` is the size of the delete-by-add
+// matrix the detector will build, because rename detection is quadratic
+// and a commit that deleted a thousand files and added a thousand is a
+// million comparisons — git gives up above its own limit and says so,
+// which is better than taking four minutes.
+pub struct GitRenameOptions
+    detect: Bool
+    similarity_threshold: Int
+    rename_limit: Int
+
+// Git's defaults: detect, 50 per cent, a limit of 1000.
+//
+// ```novo
+// use gitwork
+//
+// fn main() [io]
+//     println("${gitwork.default_rename_options().similarity_threshold}")
+// ```
+pub fn default_rename_options() -> GitRenameOptions []
+    todo("git-nv.gitwork.default_rename_options")
+
+// What is staged and what is not, for the tracked paths.
+//
+// Does NOT walk the working tree for untracked files — that is
+// `untracked`, and separating them is what lets a tool that only wants
+// "is anything uncommitted" avoid the expensive half.
+//
+// ```novo
+// use gitwork
+//
+// fn state(r: GitRepo) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+//     gitwork.status(r, gitwork.default_rename_options())
+//
+// fn main() [io]
+//     println("what changed")
+// ```
+pub fn status(r: GitRepo, ro: GitRenameOptions) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+    todo("git-nv.gitwork.status")
+
+// Just the staged half: HEAD against the index.
+//
+// What a commit hook wants, and it costs no working-tree reads at all.
+//
+// ```novo
+// use gitwork
+//
+// fn staged(r: GitRepo) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+//     gitwork.staged_changes(r, gitwork.default_rename_options())
+//
+// fn main() [io]
+//     println("what a commit would contain")
+// ```
+pub fn staged_changes(r: GitRepo,
+                      ro: GitRenameOptions) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+    todo("git-nv.gitwork.staged_changes")
+
+// Is the working tree clean?
+//
+// Tracked paths only, which is what "clean" means to a release tool —
+// an untracked build directory is not a reason to refuse a tag.  A tool
+// that wants the stricter answer asks `untracked` too and says so.
+//
+// The `novo pkg publish` check `--allow-dirty` overrides is exactly
+// this question, and it is a `proc`-spawned `git status --porcelain`
+// today.
+//
+// ```novo
+// use gitwork
+//
+// fn ok(r: GitRepo) -> Result<Bool, GitRepoFault> [fs]
+//     gitwork.is_clean(r)
+//
+// fn main() [io]
+//     println("whether anything is uncommitted")
+// ```
+pub fn is_clean(r: GitRepo) -> Result<Bool, GitRepoFault> [fs]
+    todo("git-nv.gitwork.is_clean")
+
+// The paths in the working tree that the index does not know about and
+// the ignore rules do not exclude.
+//
+// The expensive walk, on its own.  `max_entries` bounds it, because a
+// repository with a node_modules nobody ignored has half a million
+// untracked paths and a tool that listed them all is a tool that
+// appears to hang.
+//
+// ```novo
+// use gitwork
+//
+// fn new_files(r: GitRepo) -> Result<[Str], GitRepoFault> [fs]
+//     gitwork.untracked(r, 10000)
+//
+// fn main() [io]
+//     println("what is not in the repository")
+// ```
+pub fn untracked(r: GitRepo, max_entries: Int) -> Result<[Str], GitRepoFault> [fs]
+    todo("git-nv.gitwork.untracked")
+
+// One parsed `.gitignore` file.
+//
+// The rules in order, because the LAST matching one decides and a
+// reader that stopped at the first gets every negation wrong.
+pub struct GitIgnoreFile
+    // The directory this file governs, relative to the work tree root.
+    // A rule's anchoring is relative to this, which is why the two
+    // travel together.
+    directory: Str
+    rules: [GitIgnoreRule]
+
+// One line of a `.gitignore`.
+pub struct GitIgnoreRule
+    pattern: Str
+    // A leading `!`: this rule RE-INCLUDES what an earlier one
+    // excluded.
+    negated: Bool
+    // A trailing `/`: matches directories only.
+    directory_only: Bool
+    // The pattern contains a `/` other than a trailing one, so it is
+    // anchored to `directory` rather than matching at any depth.  The
+    // rule most reimplementations miss, and the reason `build/` and
+    // `*/build` mean different things.
+    anchored: Bool
+
+// Parse one `.gitignore`.
+//
+// `[]` — the file's text is the caller's, so the whole ignore grammar
+// is testable with no filesystem.
+//
+// ```novo
+// use gitwork
+//
+// fn read(text: Str) -> GitIgnoreFile
+//     gitwork.parse_gitignore("", text)
+//
+// fn main() [io]
+//     println("a gitignore, as rules")
+// ```
+pub fn parse_gitignore(directory: Str, text: Str) -> GitIgnoreFile []
+    todo("git-nv.gitwork.parse_gitignore")
+
+// Is this path ignored, given the ignore files from the root down?
+//
+// The stack in root-to-deepest order, and the LAST matching rule in the
+// DEEPEST file wins — which is git's rule and is the opposite of what a
+// first-match search does.  `is_directory` matters because a
+// `directory_only` rule does not match a file of the same name.
+//
+// `[]`, so the whole rule set is testable against git's own
+// `t/t0008-ignores` cases with no working tree in the room.
+//
+// ```novo
+// use gitwork
+//
+// fn skipped(files: [GitIgnoreFile]) -> Bool
+//     gitwork.gitignore_matches(files, "build/out.o", false)
+//
+// fn main() [io]
+//     println("whether git would ignore a path")
+// ```
+pub fn gitignore_matches(files: [GitIgnoreFile], path: Str, is_directory: Bool) -> Bool []
+    todo("git-nv.gitwork.gitignore_matches")
+
+// Which rule decided, and in which file.
+//
+// `git check-ignore -v` as a value.  Published because "why is my file
+// ignored" is a question with a specific answer — a line number in a
+// particular file — and a boolean cannot give it.
+//
+// ```novo
+// use gitwork
+//
+// fn why(files: [GitIgnoreFile]) -> ?GitIgnoreMatch
+//     gitwork.gitignore_reason(files, "build/out.o", false)
+//
+// fn main() [io]
+//     println("which rule ignored a path")
+// ```
+pub fn gitignore_reason(files: [GitIgnoreFile], path: Str, is_directory: Bool) -> ?GitIgnoreMatch []
+    todo("git-nv.gitwork.gitignore_reason")
+
+// The rule that decided a path's fate.
+pub struct GitIgnoreMatch
+    directory: Str
+    rule: GitIgnoreRule
+    // Its position in that file, so a message can name a line.
+    line: Int
+
+// The diff between two blobs, as diff-nv's script.
+//
+// Tokenised by line with git's own whitespace handling.  The hunks a
+// caller renders are `diffscript.hunks`, so a tool that already renders
+// a diff renders this one and nothing new is invented.
+//
+// ```novo
+// use gitwork
+//
+// fn between(a: Bytes, b: Bytes) -> DiffScript
+//     gitwork.diff_blobs(a, b, diffscript.default_options())
+//
+// fn main() [io]
+//     println("the change between two blobs")
+// ```
+pub fn diff_blobs(a: Bytes, b: Bytes, o: DiffOptions) -> DiffScript []
+    todo("git-nv.gitwork.diff_blobs")
+
+// The changes between two trees.
+//
+// Walks both, descending only where the ids differ — which is the one
+// optimisation that makes a diff of two large trees fast, because an
+// unchanged directory has one id and is skipped whole.
+//
+// ```novo
+// use gitwork
+//
+// fn between(r: GitRepo, a: GitOid, b: GitOid) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+//     gitwork.diff_trees(r, a, b, gitwork.default_rename_options())
+//
+// fn main() [io]
+//     println("what two commits differ by")
+// ```
+pub fn diff_trees(r: GitRepo, a: GitOid, b: GitOid,
+                  ro: GitRenameOptions) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+    todo("git-nv.gitwork.diff_trees")
+
+// How alike two blobs are, as the percentage git computes.
+//
+// The number `GitRenamed` carries and `similarity_threshold` compares
+// against.  Published because rename detection is the part of a diff a
+// person argues with — "that is not the same file" — and a tool that
+// can show the percentage can be argued with productively.
+//
+// ```novo
+// use gitwork
+//
+// fn alike(a: Bytes, b: Bytes) -> Int
+//     gitwork.similarity(a, b)
+//
+// fn main() [io]
+//     println("how alike two blobs are")
+// ```
+pub fn similarity(a: Bytes, b: Bytes) -> Int []
+    todo("git-nv.gitwork.similarity")
+
+// Which commit last touched each line of a file.
+//
+// `budget` is a count of commits to walk; the answer says whether it
+// was exhausted, and the lines it did not reach carry the oldest commit
+// it looked at rather than a wrong one.  A blame that ran unbounded is
+// a tool that appears to hang on exactly the files people most want to
+// blame.
+//
+// ```novo
+// use gitwork
+//
+// fn who(r: GitRepo, tip: GitOid) -> Result<GitBlame, GitRepoFault> [fs]
+//     gitwork.blame(r, tip, "src/main.nv", 500)
+//
+// fn main() [io]
+//     println("who last touched each line")
+// ```
+pub fn blame(r: GitRepo, tip: GitOid, path: Str, budget: Int) -> Result<GitBlame, GitRepoFault> [fs]
+    todo("git-nv.gitwork.blame")
+
+// A blame result.
+pub struct GitBlame
+    lines: [GitBlameLine]
+    // The budget ran out before every line was resolved.  A field
+    // rather than a silence, because a blame that says "everything is
+    // from this commit" and a blame that gave up look identical
+    // otherwise.
+    exhausted: Bool
+    // How many commits were walked, so a caller can raise the budget by
+    // a number rather than a guess.
+    commits_walked: Int
+
+// One line's origin.
+pub struct GitBlameLine
+    // 1-based, as a person counts.
+    line: Int
+    commit: GitOid
+    // The line's number in the commit that introduced it, which differs
+    // from `line` wherever the file has been edited above it — and is
+    // what a caller needs to show the original context.
+    original_line: Int
+    // The path the line was at in that commit, which differs after a
+    // rename.
+    original_path: Str
+
+// Which of these paths a `status` would call modified, without hashing
+// the ones it does not have to.
+//
+// The `stat`-cache fast path, exposed: a caller supplying the current
+// `stat` for each path gets back only the ones that have to be read.
+// It is `[]` — the `stat` blocks are the caller's — so a tool can batch
+// its filesystem calls however it likes and still get git's answer.
+//
+// ```novo
+// use gitwork
+//
+// fn suspect(ix: GitIndex, paths: Bytes, now: [GitStat]) -> [Str]
+//     gitwork.paths_to_rehash(ix, paths, now, true, true)
+//
+// fn main() [io]
+//     println("the files that actually have to be read")
+// ```
+pub fn paths_to_rehash(ix: GitIndex, paths: Bytes, current: [GitStat], trust_ctime: Bool,
+                       check_stat: Bool) -> [Str] []
+    todo("git-nv.gitwork.paths_to_rehash")
+
+// A one-letter code for a change, as `git status --porcelain` prints
+// it.
+//
+// `A`, `M`, `D`, `R`, `T`, and a space for unchanged.  Published
+// because a tool that emits porcelain for something else to parse must
+// emit exactly these, and because a tool that CONSUMES porcelain today
+// — which is what `novo pkg publish`'s dirty check does — can be
+// rewritten against this and produce the same strings.
+//
+// ```novo
+// use gitwork
+//
+// fn main() [io]
+//     println(gitwork.change_code(GitModified))
+// ```
+pub fn change_code(c: GitChange) -> Str []
+    todo("git-nv.gitwork.change_code")
+
+// The two-letter porcelain line for one entry.
+//
+// Staged code then unstaged code, which is the column order
+// `--porcelain` uses and which is transposed by about half the tools
+// that parse it.
+//
+// ```novo
+// use gitwork
+//
+// fn line(e: GitStatusEntry) -> Str
+//     gitwork.porcelain_line(e)
+//
+// fn main() [io]
+//     println("one line of porcelain status")
+// ```
+pub fn porcelain_line(e: GitStatusEntry) -> Str []
+    todo("git-nv.gitwork.porcelain_line")

@@ -1,0 +1,169 @@
+// gitpack_tests.nv — the pack reader, and the encoding nobody gets
+// right.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitpack.<fn>`.
+//
+// THE OFFSET-DELTA CASES ARE THE POINT OF THE FILE.  The encoding is
+// big-endian base-128 where each continuation ADDS ONE before shifting,
+// so `0x80 0x00` is 128 and not 0 — and a reader that reused a LEB128
+// routine is correct for every offset below 128, which means it passes a
+// test written against a small pack and fails against a real one.  The
+// two-byte cases below are exactly the boundary.
+//
+// THE BOUNDS ARE A SECURITY PROPERTY.  A delta claims its output size in
+// its own payload, so a pack from a stranger can ask a reader to
+// allocate a terabyte, and the check has to be on the CLAIM rather than
+// on the result.  `delta_sizes` is published for that reason and is
+// asserted here as a reading and not as a side effect of resolution.
+
+use std.test
+use std.list
+use gitpack
+
+@test
+fn test_the_default_bounds_are_gits_own() [io]
+    let l = gitpack.default_limits()
+
+    test.case("a delta chain of fifty, which is what git packs to")
+    test.assert(l.max_depth == 50)
+
+    test.case("and an object bound that exists at all")
+    test.assert(l.max_object_bytes > 0)
+
+@test
+fn test_a_caller_can_tighten_both_bounds() [io]
+    let l = gitpack.limits(20, 268435456)
+
+    test.case("a shallower chain")
+    test.assert(l.max_depth == 20)
+
+    test.case("and a smaller object, which is what fetching from a stranger wants")
+    test.assert(l.max_object_bytes == 268435456)
+
+@test
+fn test_the_offset_delta_encoding_is_not_leb128() [io]
+    test.case("one byte below the boundary is itself")
+    match gitpack.parse_ofs_delta_base(bytes.from_byte_list([127]), 0)
+        Some((n, back)) =>
+            test.assert(n == 1)
+            test.assert(back == 127)
+        None            => test.assert(false)
+
+    test.case("two bytes at the boundary are 128, which LEB128 would read as 0")
+    match gitpack.parse_ofs_delta_base(bytes.from_byte_list([128, 0]), 0)
+        Some((n, back)) =>
+            test.assert(n == 2)
+            test.assert(back == 128)
+        None            => test.assert(false)
+
+    test.case("and the next one is 129, which LEB128 would read as 1")
+    match gitpack.parse_ofs_delta_base(bytes.from_byte_list([128, 1]), 0)
+        Some((_, back)) => test.assert(back == 129)
+        None            => test.assert(false)
+
+@test
+fn test_a_pack_header_says_what_it_holds() [io]
+    test.case("the signature is PACK and the version is 2")
+    let head = bytes.from_byte_list([80, 65, 67, 75, 0, 0, 0, 2, 0, 0, 0, 3])
+    match gitpack.parse_pack_header(head)
+        Ok((version, count)) =>
+            test.assert(version == 2)
+            test.assert(count == 3)
+        Err(_)               => test.assert(false)
+
+    test.case("and anything else is refused by name")
+    match gitpack.parse_pack_header(bytes.from_byte_list([80, 65, 67, 76, 0, 0, 0, 2, 0, 0, 0, 0]))
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_a_reader_asks_before_it_reads() [io]
+    test.case("starting a read answers a range and performs nothing")
+    match gitpack.read_at(12, gitpack.default_limits(), GitSha1)
+        GitPackNeeds(read, _) => test.assert(read.at == 12)
+        GitPackDone(_, _)     => test.assert(false)
+        GitPackFollows(_, _)  => test.assert(false)
+
+@test
+fn test_a_fresh_reader_is_at_depth_zero() [io]
+    match gitpack.read_at(12, gitpack.default_limits(), GitSha1)
+        GitPackNeeds(_, r)   => test.assert(gitpack.depth_of(r) == 0)
+        GitPackDone(_, _)    => test.assert(false)
+        GitPackFollows(_, _) => test.assert(false)
+
+@test
+fn test_a_delta_declares_its_sizes_before_anything_is_allocated() [io]
+    test.case("the two varints at the head of a delta payload")
+    match gitpack.delta_sizes(bytes.from_byte_list([4, 8, 144, 4]))
+        Some((base, result)) =>
+            test.assert(base == 4)
+            test.assert(result == 8)
+        None                 => test.assert(false)
+
+    test.case("and a payload too short to hold them is None rather than a guess")
+    test.assert(gitpack.delta_sizes(bytes.from_byte_list([])) == None)
+
+@test
+fn test_every_pack_fault_reads_as_one_line() [io]
+    test.case("a bad signature")
+    test.assert(GitPackBadSignature.message() != "")
+
+    test.case("a cycle, which is what a crafted pack produces")
+    test.assert(GitPackCycle(1024).message() != "")
+
+    test.case("an over-large claim names both numbers")
+    test.assert(GitPackTooLarge(1024, 1099511627776, 1073741824).message() != "")
+
+    test.case("and two faults do not read the same")
+    test.assert(GitPackBadSignature.message() != GitPackCycle(0).message())
+
+@test
+fn test_a_missing_base_is_a_thin_pack_and_not_corruption() [io]
+    test.case("the fault names the base so a caller can look it up")
+    test.assert(GitPackMissingBase("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").message()
+                != "")
+
+// The reader's own request loop and the index lookups, named with the
+// rows they declare.  A suite cannot carry a real packfile, and the pack
+// format's oracle is libgit2's fixtures rather than a literal in a test
+// file, so these are compiled: the assertion is that each signature is
+// callable and pure.
+fn opened(idx: Bytes) -> Result<GitPackIndex, GitPackFault>
+    gitpack.parse_index(idx, GitSha1)
+
+fn located(ix: GitPackIndex, idx: Bytes, o: GitOid) -> Int
+    match gitpack.offset_of(ix, idx, o)
+        Some(n) => n
+        None    => -1
+
+fn nth(ix: GitPackIndex, idx: Bytes) -> Bool
+    gitpack.oid_at(ix, idx, 0) != None
+
+fn prefixed(ix: GitPackIndex, idx: Bytes) -> Int
+    list.len(gitpack.oids_with_prefix(ix, idx, "4bf92f3"))
+
+fn advanced(r: GitPackReader, chunk: Bytes) -> Result<GitPackStep, GitPackFault>
+    gitpack.step(r, chunk)
+
+fn completed(r: GitPackReader, base: Bytes) -> Result<GitPackStep, GitPackFault>
+    gitpack.supply_base(r, GitKindBlob, base)
+
+fn entry(pack: Bytes) -> Result<GitPackEntry, GitPackFault>
+    gitpack.parse_entry_header(pack, 12, GitSha1)
+
+fn built(base: Bytes, delta: Bytes) -> Result<Bytes, GitPackFault>
+    gitpack.apply_delta(base, delta, gitpack.default_limits())
+
+fn paired(pack: Bytes, idx: Bytes) -> Bool
+    gitpack.index_matches_pack(pack, idx)
+
+@test
+fn test_the_index_and_the_reader_are_callable_and_pure() [io]
+    test.case("a truncated index is refused rather than read")
+    match opened(bytes.from_byte_list([255, 116, 79, 99]))
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("and an index that does not belong to its pack is caught")
+    test.assert(paired(bytes.from_str("a"), bytes.from_str("b")) == false)

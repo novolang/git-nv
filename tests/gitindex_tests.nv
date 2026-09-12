@@ -1,0 +1,191 @@
+// gitindex_tests.nv — the cache `status` runs on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitindex.<fn>`.
+//
+// THE RACY-CLEAN CASE IS WHY THIS FILE EXISTS.  A file written in the
+// same second the index was written has an mtime equal to the index's
+// own, and no comparison of mtimes can tell "unchanged" from "changed
+// within the second".  Git hashes such an entry anyway; a reader that
+// did not reports a modified file as clean, once, unreproducibly — which
+// is the worst wrong answer a version-control tool can give, because it
+// looks like the user imagined it.
+//
+// THE `checkStat` CASES ARE THE SECOND HALF.  On a network filesystem
+// `dev`, `ino`, `uid` and `gid` are all wrong, and a comparison that
+// required them to match reports every file modified on every `status`.
+// The flags are parameters here for exactly that reason.
+
+use std.test
+use std.list
+use gitobj
+use gitindex
+
+fn a_stat(mtime: Int, size: Int) -> GitStat
+    gitindex.stat_of(0, 0, mtime, 0, 1, 2, 33188, 1000, 1000, size)
+
+fn an_entry(mtime: Int, size: Int) -> GitIndexEntry
+    GitIndexEntry { stat: a_stat(mtime, size),
+                    oid: gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1),
+                    stage: 0, assume_valid: false, skip_worktree: false,
+                    path_at: 0, path_len: 0 }
+
+@test
+fn test_an_unchanged_stat_means_the_file_is_not_read() [io]
+    let e = an_entry(1757548800, 42)
+
+    test.case("the same stat, so nothing has to be hashed")
+    test.assert(gitindex.needs_rehash(e, a_stat(1757548800, 42), true, true) == false)
+
+@test
+fn test_a_changed_size_or_mtime_means_it_is() [io]
+    let e = an_entry(1757548800, 42)
+
+    test.case("a different size")
+    test.assert(gitindex.needs_rehash(e, a_stat(1757548800, 43), true, true))
+
+    test.case("and a different mtime")
+    test.assert(gitindex.needs_rehash(e, a_stat(1757548900, 42), true, true))
+
+@test
+fn test_the_stat_flags_are_parameters_because_a_network_filesystem_lies() [io]
+    let e = an_entry(1757548800, 42)
+    let elsewhere = gitindex.stat_of(0, 0, 1757548800, 0, 0, 0, 33188, 0, 0, 42)
+
+    test.case("with the full check, a zeroed dev and ino look like a change")
+    test.assert(gitindex.needs_rehash(e, elsewhere, true, true))
+
+    test.case("with the minimal check they do not, which is what core.checkStat is for")
+    test.assert(gitindex.needs_rehash(e, elsewhere, true, false) == false)
+
+@test
+fn test_an_entry_written_in_the_indexs_own_second_is_racy() [io]
+    let e = an_entry(1757548800, 42)
+
+    test.case("the same second as the index: indistinguishable, so it is dirty")
+    test.assert(gitindex.is_racy(e, 1757548800, 0))
+
+    test.case("a second earlier: safely older")
+    test.assert(gitindex.is_racy(e, 1757548801, 0) == false)
+
+    test.case("and a file NEWER than the index is racy too, which is the case that surprises")
+    test.assert(gitindex.is_racy(an_entry(1757548900, 42), 1757548800, 0))
+
+@test
+fn test_a_bad_index_says_what_was_wrong() [io]
+    test.case("bytes that are not an index")
+    match gitindex.parse(bytes.from_str("not an index"), GitSha1)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+    test.case("and the faults do not all read the same")
+    test.assert(GitIndexBadSignature.message() != GitIndexBadVersion(5).message())
+
+@test
+fn test_a_version_the_reader_does_not_know_is_named() [io]
+    test.case("the fault carries the number, so a message can say which")
+    test.assert(GitIndexBadVersion(5).message() != "")
+
+@test
+fn test_a_path_with_three_stages_is_a_conflict() [io]
+    let base = GitIndexEntry { stat: a_stat(1, 1),
+                               oid: gitobj.null_oid(GitSha1), stage: 1,
+                               assume_valid: false, skip_worktree: false,
+                               path_at: 0, path_len: 3 }
+    let ours = GitIndexEntry { stat: a_stat(1, 1),
+                               oid: gitobj.null_oid(GitSha1), stage: 2,
+                               assume_valid: false, skip_worktree: false,
+                               path_at: 0, path_len: 3 }
+    let ix = GitIndex { version: 2, entries: [base, ours], algo: GitSha1,
+                        extensions: [] }
+
+    test.case("two stages of one path is a conflict")
+    test.assert(list.len(gitindex.conflicts(ix, bytes.from_str("a.c"))) == 1)
+
+    test.case("and an index of stage-0 entries has none")
+    let clean = GitIndex { version: 2, entries: [an_entry(1, 1)], algo: GitSha1,
+                           extensions: [] }
+    test.assert(list.len(gitindex.conflicts(clean, bytes.from_str("a.c"))) == 0)
+
+@test
+fn test_a_lookup_takes_the_stage_as_well_as_the_path() [io]
+    let ix = GitIndex { version: 2, entries: [an_entry(1, 1)], algo: GitSha1,
+                        extensions: [] }
+
+    test.case("stage 0 for an ordinary file")
+    test.assert(gitindex.entry_of(ix, bytes.from_str(""), "", 0) != None)
+
+    test.case("and stage 2 is a different key, not the same entry")
+    test.assert(gitindex.entry_of(ix, bytes.from_str(""), "", 2) == None)
+
+@test
+fn test_an_empty_index_is_a_version_and_nothing_else() [io]
+    let ix = gitindex.empty(2, GitSha1)
+
+    test.case("the version it was asked for")
+    test.assert(ix.version == 2)
+
+    test.case("and nothing in it")
+    test.assert(list.len(ix.entries) == 0)
+    test.assert(list.len(ix.extensions) == 0)
+
+@test
+fn test_the_extensions_are_kept_rather_than_dropped() [io]
+    let ix = GitIndex { version: 2, entries: [], algo: GitSha1,
+                        extensions: [GitIndexExtension { signature: "TREE",
+                                                         at: 100, len: 40 }] }
+
+    test.case("the cached tree is findable by name")
+    match gitindex.extension_of(ix, "TREE")
+        Some(x) => test.assert(x.len == 40)
+        None    => test.assert(false)
+
+    test.case("and one that is not there is None")
+    test.assert(gitindex.extension_of(ix, "REUC") == None)
+
+@test
+fn test_removing_a_path_removes_every_stage_of_it() [io]
+    let base = GitIndexEntry { stat: a_stat(1, 1), oid: gitobj.null_oid(GitSha1),
+                               stage: 1, assume_valid: false, skip_worktree: false,
+                               path_at: 0, path_len: 3 }
+    let ours = GitIndexEntry { stat: a_stat(1, 1), oid: gitobj.null_oid(GitSha1),
+                               stage: 2, assume_valid: false, skip_worktree: false,
+                               path_at: 0, path_len: 3 }
+    let ix = GitIndex { version: 2, entries: [base, ours], algo: GitSha1,
+                        extensions: [] }
+
+    test.case("both stages go, because leaving one is an index git cannot commit")
+    let after = gitindex.without_path(ix, bytes.from_str("a.c"), "a.c")
+    test.assert(list.len(after.entries) == 0)
+
+@test
+fn test_a_commit_over_an_unresolved_merge_is_refused() [io]
+    let base = GitIndexEntry { stat: a_stat(1, 1), oid: gitobj.null_oid(GitSha1),
+                               stage: 1, assume_valid: false, skip_worktree: false,
+                               path_at: 0, path_len: 3 }
+    let ix = GitIndex { version: 2, entries: [base], algo: GitSha1, extensions: [] }
+
+    test.case("the tree cannot be built while a path is conflicted")
+    match gitindex.tree_level(ix, bytes.from_str("a.c"), "")
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_an_index_writes_back_and_names_its_paths() [io]
+    let ix = gitindex.empty(2, GitSha1)
+
+    test.case("an empty index still serialises, with its checksum")
+    match gitindex.serialise(ix, bytes.from_str(""))
+        Ok(raw) => test.assert(bytes.len(raw) > 0)
+        Err(_)  => test.assert(false)
+
+    test.case("and a path comes back out of the bytes it points into")
+    test.assert(gitindex.path_of(an_entry(1, 1), bytes.from_str("")) == "")
+
+@test
+fn test_staging_a_path_keeps_the_file_in_gits_own_order() [io]
+    let ix = gitindex.empty(2, GitSha1)
+
+    test.case("one entry in, one entry there")
+    let after = gitindex.with_entry(ix, an_entry(1, 1), bytes.from_str(""))
+    test.assert(list.len(after.entries) == 1)

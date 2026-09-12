@@ -1,0 +1,173 @@
+// gitwire_tests.nv — the framing, which is the half that needs no
+// server.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitwire.<fn>`.
+//
+// THE OFF-BY-FOUR IS THE CASE.  A `pkt-line`'s four hex digits are the
+// TOTAL length INCLUDING themselves, so `0006a\n` is a six-byte packet
+// carrying two bytes.  An implementation that wrote the payload length
+// instead produces a stream a server reads one packet of and then
+// silently disconnects from — no error, no message, just a closed
+// connection — and it is the first thing anybody writing this protocol
+// gets wrong.
+//
+// THE SIDE-BAND CASE IS THE SECOND.  In a side-band response the first
+// payload byte is the channel: 1 is pack data, 2 is progress, 3 is a
+// fatal error.  A client that fed channel 2 into its pack reader reports
+// a corrupt pack for a server that was politely saying how far along it
+// was.
+
+use std.test
+use std.str
+use gitwire
+
+@test
+fn test_a_packets_length_includes_its_own_four_digits() [io]
+    let p = gitwire.pkt_line("a\n")
+
+    test.case("two payload bytes and four digits is six")
+    test.assert(bytes.len(p) == 6)
+
+    test.case("and the digits spell six, not two")
+    test.assert(str.starts_with(bytes.to_str(p), "0006"))
+
+@test
+fn test_the_three_magic_packets_are_four_bytes_each() [io]
+    test.case("flush")
+    test.assert(bytes.len(gitwire.flush_pkt()) == 4)
+    test.assert(bytes.to_str(gitwire.flush_pkt()) == "0000")
+
+    test.case("and the v2 delimiter")
+    test.assert(bytes.len(gitwire.delim_pkt()) == 4)
+    test.assert(bytes.to_str(gitwire.delim_pkt()) == "0001")
+
+@test
+fn test_reading_a_packet_answers_what_it_consumed() [io]
+    test.case("a data packet")
+    match gitwire.read_pkt(bytes.from_str("0006a\n"), 0)
+        Ok(Some(p)) =>
+            test.assert(p.kind == GitPktData)
+            test.assert(p.consumed == 6)
+            test.assert(p.payload_len == 2)
+        Ok(None)    => test.assert(false)
+        Err(_)      => test.assert(false)
+
+    test.case("a flush")
+    match gitwire.read_pkt(bytes.from_str("0000"), 0)
+        Ok(Some(p)) => test.assert(p.kind == GitPktFlush)
+        Ok(None)    => test.assert(false)
+        Err(_)      => test.assert(false)
+
+@test
+fn test_a_partial_packet_is_none_rather_than_an_error() [io]
+    test.case("a buffer that does not hold a whole packet yet")
+    match gitwire.read_pkt(bytes.from_str("0006a"), 0)
+        Ok(None)    => test.assert(true)
+        Ok(Some(_)) => test.assert(false)
+        Err(_)      => test.assert(false)
+
+@test
+fn test_a_length_that_is_not_hex_is_refused() [io]
+    test.case("which is what an HTML login page looks like to this parser")
+    match gitwire.read_pkt(bytes.from_str("<!DOCTYPE html>"), 0)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(e.message() != "")
+
+@test
+fn test_the_two_urls_are_built_and_not_guessed() [io]
+    test.case("the v2 request goes to git-upload-pack")
+    test.assert(gitwire.upload_pack_url("https://example.com/a/b")
+                == "https://example.com/a/b/git-upload-pack")
+
+    test.case("and the advertisement to info/refs with the service query")
+    test.assert(str.contains(gitwire.info_refs_url("https://example.com/a/b"),
+                             "info/refs"))
+
+@test
+fn test_only_http_urls_are_claimed() [io]
+    test.case("https")
+    test.assert(gitwire.is_supported_url("https://example.com/a/b"))
+
+    test.case("http")
+    test.assert(gitwire.is_supported_url("http://example.com/a/b"))
+
+    test.case("and ssh is refused by scheme rather than at connect time")
+    test.assert(gitwire.is_supported_url("ssh://user@example.com/a/b") == false)
+    test.assert(gitwire.is_supported_url("/a/local/path") == false)
+
+@test
+fn test_a_capability_with_a_value_is_still_that_capability() [io]
+    let c = GitCapabilities { version: 2,
+                              names: ["ls-refs", "fetch", "object-format=sha256"],
+                              algo: GitSha256 }
+
+    test.case("a bare name")
+    test.assert(gitwire.has_capability(c, "ls-refs"))
+
+    test.case("and a name=value one, which a list membership test misses")
+    test.assert(gitwire.has_capability(c, "object-format"))
+
+    test.case("something the server did not offer")
+    test.assert(gitwire.has_capability(c, "push-options") == false)
+
+@test
+fn test_retrying_the_wrong_status_wastes_a_minute_on_a_typo() [io]
+    test.case("unreachable is worth trying again")
+    test.assert(gitwire.is_retryable(GitWireUnreachable("https://x", "timed out")))
+
+    test.case("a 503 is")
+    test.assert(gitwire.is_retryable(GitWireHttpStatus(503, "https://x")))
+
+    test.case("a 404 is NOT — a typo in a dependency URL should fail at once")
+    test.assert(gitwire.is_retryable(GitWireHttpStatus(404, "https://x")) == false)
+
+    test.case("nor is a 401, which wants a credential rather than patience")
+    test.assert(gitwire.is_retryable(GitWireHttpStatus(401, "https://x")) == false)
+
+    test.case("and nor does a protocol fault improve on repetition")
+    test.assert(gitwire.is_retryable(GitWireBadPacket(0)) == false)
+
+@test
+fn test_an_html_login_page_is_its_own_fault() [io]
+    test.case("because every hand-written client reports it as a parse error")
+    test.assert(GitWireNotSmartHttp("text/html").message() != "")
+
+@test
+fn test_a_remote_carries_its_whole_configuration() [io]
+    let r = gitwire.remote("https://example.com/a/b")
+
+    test.case("the url")
+    test.assert(r.url == "https://example.com/a/b")
+
+    test.case("no credential until one is given")
+    test.assert(r.authorization == "")
+
+    test.case("a deadline, because a telemetry-free hang is still a hang")
+    test.assert(r.timeout_seconds > 0.0)
+
+    test.case("and an agent, because some forges rate-limit by it")
+    test.assert(r.agent != "")
+
+@test
+fn test_a_credential_is_a_header_value_the_caller_built() [io]
+    let r = gitwire.with_authorization(gitwire.remote("https://example.com/a/b"),
+                                       "Bearer abc")
+
+    test.case("carried verbatim, because where a secret lives is not this package's business")
+    test.assert(r.authorization == "Bearer abc")
+
+// The two rows that reach a server, named with the `[net]` they declare.
+// A suite cannot assert what a forge answers, so these are compiled
+// rather than run — and that they are only two is the disclosure.
+fn ask(r: GitRemote) -> Result<GitCapabilities, GitWireFault> [net]
+    gitwire.capabilities(r)
+
+fn list_tags(r: GitRemote) -> Result<[GitRemoteRef], GitWireFault> [net]
+    gitwire.ls_refs(r, ["refs/tags/"], true)
+
+fn get_pack(r: GitRemote, want: GitOid) -> Result<GitFetched, GitWireFault> [net]
+    gitwire.fetch(r, [want], [], 1)
+
+fn channel(buf: Bytes, p: GitPacket) -> Int
+    gitwire.sideband_of(buf, p)

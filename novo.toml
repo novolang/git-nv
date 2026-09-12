@@ -1,0 +1,71 @@
+[package]
+name        = "git-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "Git plumbing without libgit2: the four object types to and from bytes under either hash, loose objects and packfiles with delta resolution as readers over ranges of a caller's bytes, refs and packed-refs, the index file, and the porcelain a tool needs — status, log, diff and blame — over the standard library's filesystem, with the smart HTTP protocol as a client.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the split inside it is the design.  FOUR OF THE SEVEN
+# MODULES DECLARE NOTHING: the object model, the packfile reader, the
+# index file and the reference grammar are arithmetic over bytes the
+# caller already holds, and they are where the format actually lives.
+# Three modules perform: `gitrepo` and `gitwork` read the working tree
+# (`[fs]`), and `gitwire` speaks to a server (`[net]`).
+#
+# THE FOUR PURE MODULES EARN THEIR OWN ROW, and the README's
+# § The missing row argues it: `git-core-nv` at `core` would let a
+# package that only reads objects — a registry, a build cache, a
+# firmware image signer — take the format without taking a filesystem,
+# and every one of those modules is already `[]`.
+layer       = "host"
+
+category    = "tooling"
+
+tags        = ["git", "packfile", "object-store", "refs", "plumbing", "smart-http"]
+repository  = "https://github.com/novolang/git-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Reading a git repository without libgit2"
+
+[dependencies]
+# Object ids.  SHA-1 for the format git has, SHA-256 for the one it is
+# moving to, and the package has both — which is why the hash is a
+# parameter on every call that makes an id rather than a constant.
+#
+# The SHA-1 here is the plain one, NOT the collision-detecting variant
+# git itself now uses.  That difference is named in the README rather
+# than hidden: a repository carrying the two known colliding PDFs
+# produces objects this package will hash and git will refuse.
+crypto-nv = "^0.1.1"
+
+# zlib.  Every loose object is a zlib stream and so is every packed
+# object's payload, and `inflate.feed` is exactly the feed-and-drain
+# shape a pack reader over a caller's bytes needs — no file, no
+# allocation the caller did not ask for.
+flate-nv = "^0.0.2"
+
+# The diff.  `gitwork.diff_blobs` tokenises two blobs and hands them to
+# `diffscript.diff`; the hunks a caller renders are diff-nv's, so a tool
+# that already renders a diff renders this one.
+#
+# Not a re-implementation: git's own diff is Myers with the same
+# patience and histogram variants diff-nv already publishes, and the
+# one thing git adds — rename detection by similarity — is arithmetic
+# over the scripts rather than a different algorithm.
+diff-nv = "^0.0.1"

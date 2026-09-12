@@ -1,0 +1,407 @@
+// gitwire.nv — the smart HTTP protocol, scoped to what a package
+// manager needs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SCOPE IS HONEST AND IT IS SMALL.  This is the READ half of git's
+// smart HTTP transport: list the refs a server has, and fetch a pack of
+// the objects behind some of them.  That is `ls-remote` and `clone
+// --depth 1` and `fetch`, which is the whole of what a package manager
+// resolving a git dependency does — and it is a fraction of the
+// protocol.  What is deliberately absent:
+//
+//   - PUSH.  `receive-pack`, the atomic-update negotiation, the
+//     side-band progress muxing on the send side.  A package manager
+//     never pushes, and a half-implemented push is worse than none.
+//   - SSH AND THE GIT DAEMON.  Two more transports with their own
+//     authentication stories; HTTPS is what a registry and a forge both
+//     speak, and it is the one the standard library already has.
+//   - THE v0 PROTOCOL's full capability set.  `multi_ack_detailed`,
+//     `shallow` beyond depth 1, `filter` for partial clones.
+//
+// PROTOCOL v2 IS THE ONE IMPLEMENTED, and the reason is `ls-refs`: in
+// v0 a server sends EVERY ref before the client says anything, so
+// resolving one tag out of a repository with fifty thousand refs
+// downloads all fifty thousand.  v2 lets the client ask for a prefix.
+// For `novo pkg add`, which wants `refs/tags/*` and nothing else, that
+// is the difference between a fast resolution and a slow one.  v0 is
+// parsed for a server that does not offer v2, and only far enough to
+// read the ref advertisement.
+//
+// THE FRAMING IS `pkt-line` AND IT IS `[]`.  Every message in this
+// protocol is a four-hex-digit length followed by that many bytes, with
+// three magic lengths — `0000` flush, `0001` delimiter, `0002` response
+// end — and it is the one part of the protocol a test can cover
+// completely with no server.  So the codec is pure and only `ls_refs`
+// and `fetch` declare `[net]`.
+//
+// `[net]` AND NOT `[io, net]`: this module opens no file and spawns
+// nothing.  What it does with the pack it receives is the caller's, and
+// `gitrepo.write_object` is where `[fs]` is spent.
+
+// One advertised ref.
+//
+// `peeled` is what the server sends for an annotated tag when the
+// client asked for it — and asking is one word in the request, so a
+// client that did not has to fetch every tag object to find the commits.
+pub struct GitRemoteRef
+    name: Str
+    oid: GitOid
+    peeled: ?GitOid
+    // The server said this ref is symbolic and names that one.  How
+    // `HEAD` is advertised, and the only way to learn a repository's
+    // default branch without cloning it.
+    symref_target: Str
+
+// Why a conversation with a server did not work.
+//
+// The transport faults and the protocol faults are separate arms
+// because a caller retries one and reports the other, and because a
+// 401 wants a credential rather than a retry.
+pub enum GitWireFault
+    // The connection failed, or the deadline expired.
+    GitWireUnreachable(url: Str, detail: Str)
+    // The server answered with a status.  401 and 403 want a
+    // credential, 404 means the repository is not there or is private,
+    // and a 5xx is worth retrying — three different actions, which is
+    // why the number is carried.
+    GitWireHttpStatus(status: Int, url: Str)
+    // The server answered with a content type that is not this
+    // protocol's.  Almost always an HTML login page, which is what a
+    // private repository behind a proxy returns and which every
+    // hand-written client reports as a parse error.
+    GitWireNotSmartHttp(content_type: Str)
+    // A `pkt-line` whose length prefix is not four hex digits, or that
+    // runs past the buffer.
+    GitWireBadPacket(at: Int)
+    // The server refused protocol v2 and its v0 advertisement was not
+    // one either.
+    GitWireNoProtocol(detail: Str)
+    // The server sent an `ERR ` packet.  Its text is the server's own,
+    // which is the only place a caller learns "repository not found" as
+    // distinct from a 404 on the URL.
+    GitWireServerError(text: Str)
+    // A capability this client needs and the server did not offer.
+    GitWireMissingCapability(name: Str)
+    // The server sent a `shallow` line for a fetch that did not ask to
+    // be shallow.
+    GitWireUnexpectedShallow
+
+// The standard `Error` implementation.
+impl Error for GitWireFault
+    // One line: what the server did, and what a caller can do about it.
+    //
+    // A status names the number, because 401 and 404 lead to opposite
+    // actions and "the fetch failed" leads to neither.
+    fn message(self) -> Str
+        todo("git-nv.gitwire.GitWireFault.message")
+
+// What a client needs to talk to one repository.
+//
+// The credential is a header value the caller built, not a username and
+// a password: a token, a basic header, whatever the forge wants.  This
+// package does not read a credential helper, a netrc or an environment
+// variable, because doing so would be this package deciding where a
+// secret lives.
+pub struct GitRemote
+    // The repository URL, without the `/info/refs` suffix.
+    url: Str
+    // The whole `Authorization` header value, or empty.
+    authorization: Str
+    // Seconds before a request gives up.
+    timeout_seconds: Float
+    // The agent string.  Sent because some forges rate-limit by it, and
+    // a client that sent nothing looks like a scraper.
+    agent: Str
+
+// A remote with no credential and a sensible deadline.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println(gitwire.remote("https://github.com/novolang/cli").url)
+// ```
+pub fn remote(url: Str) -> GitRemote []
+    todo("git-nv.gitwire.remote")
+
+// The same remote with an `Authorization` header value.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     let r = gitwire.with_authorization(
+//         gitwire.remote("https://github.com/novolang/cli"), "Bearer x")
+//     println(r.url)
+// ```
+pub fn with_authorization(r: GitRemote, header_value: Str) -> GitRemote []
+    todo("git-nv.gitwire.with_authorization")
+
+// The refs the server has, optionally under a prefix.
+//
+// `[net]`.  The prefix is protocol v2's `ref-prefix`, and it is the
+// whole reason v2 is the version implemented: a repository with fifty
+// thousand tags answers `refs/tags/v1.` in one small response, where v0
+// would send every ref it has before the client could say a word.
+//
+// `peel` asks the server to include the commit behind each annotated
+// tag, which costs it nothing and saves the client one object fetch per
+// tag.
+//
+// ```novo
+// use gitwire
+//
+// fn tags(r: GitRemote) -> Result<[GitRemoteRef], GitWireFault> [net]
+//     gitwire.ls_refs(r, ["refs/tags/"], true)
+//
+// fn main() [io]
+//     println("the tags a server has")
+// ```
+pub fn ls_refs(r: GitRemote, prefixes: [Str],
+               peel: Bool) -> Result<[GitRemoteRef], GitWireFault> [net]
+    todo("git-nv.gitwire.ls_refs")
+
+// Fetch a pack containing these objects.
+//
+// `[net]`.  `have` is what the caller already has, which is what makes a
+// fetch incremental — a client that sent none downloads the whole
+// history every time.  `depth` of 1 is a shallow fetch, which is what a
+// package manager wants and what `git clone --depth 1` does.
+//
+// Answers the pack bytes, NOT a repository: writing them is
+// `gitrepo`'s, and keeping the two apart is what lets a caller verify a
+// pack before it lets it near a store.
+//
+// ```novo
+// use gitwire
+//
+// fn get(r: GitRemote, want: GitOid) -> Result<GitFetched, GitWireFault> [net]
+//     gitwire.fetch(r, [want], [], 1)
+//
+// fn main() [io]
+//     println("a pack, fetched")
+// ```
+pub fn fetch(r: GitRemote, want: [GitOid], have: [GitOid],
+             depth: Int) -> Result<GitFetched, GitWireFault> [net]
+    todo("git-nv.gitwire.fetch")
+
+// What a fetch produced.
+pub struct GitFetched
+    // The packfile, for `gitpack` to read and `gitrepo` to store.
+    pack: Bytes
+    // The commits the server said are now the boundary of a shallow
+    // history.  A caller that ignored these writes a repository whose
+    // `log` walks off the end into objects it does not have.
+    shallow: [GitOid]
+    // Anything the server sent on the progress side-band, joined.
+    // Answered rather than printed, because a library does not print.
+    progress: Str
+
+// The capabilities a server advertised.
+//
+// Answered so a caller can decide what to ask for rather than
+// discovering a refusal mid-conversation.
+pub struct GitCapabilities
+    // The protocol version the server agreed to: 0 or 2.
+    version: Int
+    // `ls-refs`, `fetch`, `object-format=sha256`, `shallow`, `filter`,
+    // and whatever else — as they were sent, because this package
+    // interprets four of them and forwarding the rest is what lets a
+    // caller do something with a fifth.
+    names: [Str]
+    // The hash the server's repository uses.  A client that assumed
+    // SHA-1 against a SHA-256 repository asks for objects by names that
+    // do not exist there.
+    algo: GitHashAlgo
+
+// Ask a server what it can do.
+//
+// `[net]`, and it is the first request of every conversation — `ls_refs`
+// and `fetch` each make it themselves, and this is published for a
+// caller that wants to decide before it asks for anything.
+//
+// ```novo
+// use gitwire
+//
+// fn ask(r: GitRemote) -> Result<GitCapabilities, GitWireFault> [net]
+//     gitwire.capabilities(r)
+//
+// fn main() [io]
+//     println("what a server offers")
+// ```
+pub fn capabilities(r: GitRemote) -> Result<GitCapabilities, GitWireFault> [net]
+    todo("git-nv.gitwire.capabilities")
+
+// Does this capability set include this name?
+//
+// `[]`, and it handles the `name=value` form as well as the bare one —
+// `object-format=sha256` is one capability whose name is
+// `object-format`, and a plain list membership test misses it.
+//
+// ```novo
+// use gitwire
+//
+// fn ok(c: GitCapabilities) -> Bool
+//     gitwire.has_capability(c, "ls-refs")
+//
+// fn main() [io]
+//     println("whether a server offers a capability")
+// ```
+pub fn has_capability(c: GitCapabilities, name: Str) -> Bool []
+    todo("git-nv.gitwire.has_capability")
+
+// Frame a payload as a `pkt-line`.
+//
+// `[]`.  Four lowercase hex digits of total length, then the bytes.
+// The length INCLUDES the four digits, which is the off-by-four every
+// implementation makes once and which produces a stream a server
+// silently disconnects from.
+//
+// ```novo
+// use gitwire
+//
+// fn framed(s: Str) -> Bytes
+//     gitwire.pkt_line(s)
+//
+// fn main() [io]
+//     println("a request line, framed")
+// ```
+pub fn pkt_line(payload: Str) -> Bytes []
+    todo("git-nv.gitwire.pkt_line")
+
+// The flush packet, `0000`.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println("${bytes.len(gitwire.flush_pkt())}")
+// ```
+pub fn flush_pkt() -> Bytes []
+    todo("git-nv.gitwire.flush_pkt")
+
+// The delimiter packet, `0001`, which v2 uses between a command and its
+// arguments.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println("${bytes.len(gitwire.delim_pkt())}")
+// ```
+pub fn delim_pkt() -> Bytes []
+    todo("git-nv.gitwire.delim_pkt")
+
+// Read one `pkt-line` out of a buffer.
+//
+// `[]`, feed-and-drain: answers the packet and how many bytes it
+// consumed, or `None` when the buffer does not hold a whole one yet —
+// which is what a caller streaming a response body needs and what a
+// parser that took the whole body cannot do.
+//
+// ```novo
+// use gitwire
+//
+// fn next(buf: Bytes) -> Result<?GitPacket, GitWireFault>
+//     gitwire.read_pkt(buf, 0)
+//
+// fn main() [io]
+//     println("one packet, out of a response")
+// ```
+pub fn read_pkt(buf: Bytes, at: Int) -> Result<?GitPacket, GitWireFault> []
+    todo("git-nv.gitwire.read_pkt")
+
+// One framed packet.
+pub struct GitPacket
+    kind: GitPacketKind
+    // A range into the buffer, so reading a 30 MB side-band response
+    // copies nothing.
+    payload_at: Int
+    payload_len: Int
+    // Total bytes this packet occupied, including the four digits.
+    consumed: Int
+
+// What a packet is.
+pub enum GitPacketKind
+    GitPktData
+    GitPktFlush
+    GitPktDelim
+    GitPktResponseEnd
+
+// Which side-band this data packet is on.
+//
+// `[]`.  In a side-band response the first payload byte is the channel:
+// 1 pack data, 2 progress, 3 a fatal error.  A client that fed channel
+// 2 into its pack reader produces a corrupt-pack report for a server
+// that was politely telling it how far along it was — which is the
+// single commonest bug in a hand-written git client.
+//
+// ```novo
+// use gitwire
+//
+// fn channel(buf: Bytes, p: GitPacket) -> Int
+//     gitwire.sideband_of(buf, p)
+//
+// fn main() [io]
+//     println("which channel a packet is on")
+// ```
+pub fn sideband_of(buf: Bytes, p: GitPacket) -> Int []
+    todo("git-nv.gitwire.sideband_of")
+
+// The URL a v2 request is POSTed to: `<url>/git-upload-pack`.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println(gitwire.upload_pack_url("https://example.com/a/b"))
+// ```
+pub fn upload_pack_url(url: Str) -> Str []
+    todo("git-nv.gitwire.upload_pack_url")
+
+// The URL the capability advertisement is fetched from:
+// `<url>/info/refs?service=git-upload-pack`.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println(gitwire.info_refs_url("https://example.com/a/b"))
+// ```
+pub fn info_refs_url(url: Str) -> Str []
+    todo("git-nv.gitwire.info_refs_url")
+
+// Is this URL one this package can speak to?
+//
+// `https://` and `http://` only.  Published as a predicate so a tool
+// that also supports `ssh://` through something else can route, and so
+// that a refusal names the scheme rather than failing at connect time.
+//
+// ```novo
+// use gitwire
+//
+// fn main() [io]
+//     println("${gitwire.is_supported_url("ssh://git@example.com/a/b")}")
+// ```
+pub fn is_supported_url(url: Str) -> Bool []
+    todo("git-nv.gitwire.is_supported_url")
+
+// Is this fault worth trying again?
+//
+// Unreachable and a 5xx status, yes; a 401, a 403, a 404 and every
+// protocol fault, no.  Published rather than left to each caller,
+// because a resolver that retried a 404 turns a typo in a dependency
+// URL into a minute of waiting.
+//
+// ```novo
+// use gitwire
+//
+// fn again(f: GitWireFault) -> Bool
+//     gitwire.is_retryable(f)
+//
+// fn main() [io]
+//     println("whether a failed fetch is worth repeating")
+// ```
+pub fn is_retryable(f: GitWireFault) -> Bool []
+    todo("git-nv.gitwire.is_retryable")

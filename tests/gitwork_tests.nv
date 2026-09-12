@@ -1,0 +1,195 @@
+// gitwork_tests.nv — status as two comparisons, and the ignore grammar.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitwork.<fn>`.
+//
+// THE IGNORE CASES ARE GIT'S OWN `t/t0008` IN MINIATURE, and they are
+// here rather than in a walk test because the grammar is `[]`: the rules
+// are text and the path is a string, so every one of them is a
+// microsecond and there is no reason to have fewer than all of them.
+//
+// THREE RULES A PLAIN GLOB DOES NOT HAVE, one case each:
+//   - `build` matches at ANY depth; `/build` and `a/build` are anchored.
+//   - a later rule wins, so `!` re-includes — and the LAST match decides
+//     rather than the first.
+//   - an excluded DIRECTORY stops the walk, so a negation inside it
+//     re-includes nothing.
+
+use std.test
+use std.list
+use gitwork
+use diffscript
+
+fn rules(text: Str) -> [GitIgnoreFile]
+    [gitwork.parse_gitignore("", text)]
+
+@test
+fn test_an_unanchored_pattern_matches_at_any_depth() [io]
+    let r = rules("build\n")
+
+    test.case("at the root")
+    test.assert(gitwork.gitignore_matches(r, "build", true))
+
+    test.case("and nested, which is what makes it unanchored")
+    test.assert(gitwork.gitignore_matches(r, "src/build", true))
+
+@test
+fn test_a_pattern_with_a_slash_is_anchored() [io]
+    let r = rules("src/build\n")
+
+    test.case("where the rule says")
+    test.assert(gitwork.gitignore_matches(r, "src/build", true))
+
+    test.case("and nowhere else, which is the rule most ports miss")
+    test.assert(gitwork.gitignore_matches(r, "other/src/build", true) == false)
+    test.assert(gitwork.gitignore_matches(r, "build", true) == false)
+
+@test
+fn test_the_last_matching_rule_decides() [io]
+    test.case("an exclusion then a negation re-includes")
+    test.assert(gitwork.gitignore_matches(rules("*.log\n!keep.log\n"),
+                                          "keep.log", false) == false)
+
+    test.case("and the other order does not, because order is the semantics")
+    test.assert(gitwork.gitignore_matches(rules("!keep.log\n*.log\n"),
+                                          "keep.log", false))
+
+@test
+fn test_a_directory_only_rule_does_not_match_a_file() [io]
+    let r = rules("build/\n")
+
+    test.case("the directory")
+    test.assert(gitwork.gitignore_matches(r, "build", true))
+
+    test.case("and not a file of the same name")
+    test.assert(gitwork.gitignore_matches(r, "build", false) == false)
+
+@test
+fn test_an_excluded_directory_cannot_be_reopened_from_inside() [io]
+    let r = rules("build/\n!build/keep.txt\n")
+
+    test.case("the directory is excluded, so the walk never descends")
+    test.assert(gitwork.gitignore_matches(r, "build", true))
+
+    test.case("and the negation inside it re-includes nothing — git's own rule")
+    test.assert(gitwork.gitignore_matches(r, "build/keep.txt", false))
+
+@test
+fn test_blank_lines_and_comments_are_not_rules() [io]
+    let f = gitwork.parse_gitignore("", "# a comment\n\n*.log\n")
+
+    test.case("one rule out of three lines")
+    test.assert(list.len(f.rules) == 1)
+
+@test
+fn test_the_deeper_file_wins() [io]
+    let stack = [gitwork.parse_gitignore("", "*.log\n"),
+                 gitwork.parse_gitignore("src", "!*.log\n")]
+
+    test.case("the root excludes")
+    test.assert(gitwork.gitignore_matches([stack[0]], "src/a.log", false))
+
+    test.case("and the deeper file re-includes, because it is consulted last")
+    test.assert(gitwork.gitignore_matches(stack, "src/a.log", false) == false)
+
+@test
+fn test_a_caller_can_be_told_which_rule_decided() [io]
+    test.case("the rule and the file it came from")
+    match gitwork.gitignore_reason(rules("*.log\n"), "a.log", false)
+        Some(m) => test.assert(m.rule.pattern == "*.log")
+        None    => test.assert(false)
+
+    test.case("and a path nothing matched has no reason")
+    test.assert(gitwork.gitignore_reason(rules("*.log\n"), "a.txt", false) == None)
+
+@test
+fn test_a_path_can_be_in_two_states_at_once() [io]
+    let e = GitStatusEntry { path: "src/main.nv", staged: GitModified,
+                             unstaged: GitModified, conflicted: false,
+                             from_path: "" }
+
+    test.case("staged as modified and modified again since")
+    test.assert(e.staged == GitModified)
+    test.assert(e.unstaged == GitModified)
+
+    test.case("which one state per path could not say")
+    let added_then_deleted = GitStatusEntry { path: "src/new.nv", staged: GitAdded,
+                                              unstaged: GitDeleted, conflicted: false,
+                                              from_path: "" }
+    test.assert(added_then_deleted.staged != added_then_deleted.unstaged)
+
+@test
+fn test_the_porcelain_codes_are_the_ones_a_parser_expects() [io]
+    test.case("the letters git prints")
+    test.assert(gitwork.change_code(GitAdded) == "A")
+    test.assert(gitwork.change_code(GitModified) == "M")
+    test.assert(gitwork.change_code(GitDeleted) == "D")
+    test.assert(gitwork.change_code(GitTypeChanged) == "T")
+    test.assert(gitwork.change_code(GitRenamed(90)) == "R")
+
+    test.case("and unchanged is a space, not an empty string")
+    test.assert(gitwork.change_code(GitUnchanged) == " ")
+
+@test
+fn test_a_porcelain_line_is_staged_then_unstaged() [io]
+    let e = GitStatusEntry { path: "src/main.nv", staged: GitAdded,
+                             unstaged: GitModified, conflicted: false,
+                             from_path: "" }
+
+    test.case("the column order half the parsers transpose")
+    test.assert(str.starts_with(gitwork.porcelain_line(e), "AM"))
+
+@test
+fn test_the_rename_defaults_are_gits() [io]
+    let ro = gitwork.default_rename_options()
+
+    test.case("detection on")
+    test.assert(ro.detect)
+
+    test.case("fifty per cent, which is git's -M default")
+    test.assert(ro.similarity_threshold == 50)
+
+    test.case("and a limit, because the detection is quadratic")
+    test.assert(ro.rename_limit > 0)
+
+@test
+fn test_similarity_is_a_percentage_a_person_can_argue_with() [io]
+    test.case("identical blobs are wholly alike")
+    test.assert(gitwork.similarity(bytes.from_str("hello"), bytes.from_str("hello")) == 100)
+
+    test.case("and two blobs with nothing in common are not")
+    test.assert(gitwork.similarity(bytes.from_str("aaaa"), bytes.from_str("zzzz")) < 50)
+
+@test
+fn test_the_stat_fast_path_names_only_the_files_that_must_be_read() [io]
+    let ix = GitIndex { version: 2, entries: [], algo: GitSha1, extensions: [] }
+
+    test.case("an index with nothing in it asks for nothing")
+    test.assert(list.len(gitwork.paths_to_rehash(ix, bytes.from_str(""), [],
+                                                 true, true)) == 0)
+
+// The working-tree half, named with the `[fs]` rows it declares.  The
+// ignore grammar above is `[]` and is tested properly; these need a
+// repository on disk, so the assertion is that each signature is
+// callable at `[fs]` and no wider.
+fn staged(r: GitRepo) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+    gitwork.staged_changes(r, gitwork.default_rename_options())
+
+fn clean(r: GitRepo) -> Result<Bool, GitRepoFault> [fs]
+    gitwork.is_clean(r)
+
+fn new_files(r: GitRepo) -> Result<[Str], GitRepoFault> [fs]
+    gitwork.untracked(r, 10000)
+
+fn between_trees(r: GitRepo, a: GitOid, b: GitOid) -> Result<[GitStatusEntry], GitRepoFault> [fs]
+    gitwork.diff_trees(r, a, b, gitwork.default_rename_options())
+
+fn who(r: GitRepo, tip: GitOid) -> Result<GitBlame, GitRepoFault> [fs]
+    gitwork.blame(r, tip, "src/main.nv", 500)
+
+@test
+fn test_a_diff_between_two_blobs_is_diff_nvs_script() [io]
+    test.case("identical blobs produce a script with nothing changed")
+    let s = gitwork.diff_blobs(bytes.from_str("a\n"), bytes.from_str("a\n"),
+                               diffscript.default_options())
+    test.assert(diffscript.unchanged(s))

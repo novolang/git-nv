@@ -1,0 +1,110 @@
+// gitrepo_tests.nv — the `[fs]` half, named rather than exercised.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitrepo.<fn>`.
+//
+// WHAT THIS SUITE CAN AND CANNOT DO.  Every row in `gitrepo` is `[fs]`,
+// and a suite that built a repository on disk to assert against would be
+// testing the filesystem as much as the package — which is the argument
+// the module note makes for keeping the format in four `[]` modules,
+// where `gitobj_tests`, `gitpack_tests`, `gitref_tests` and
+// `gitindex_tests` cover it properly with no disk in the room.
+//
+// So this file asserts the two things that are testable without one: the
+// fault type, whose messages are what a person reads when a repository
+// is not where they thought, and the SIGNATURES, as named functions
+// declared `[fs]` that the compiler checks are callable at that row.
+
+use std.test
+use gitrepo
+
+@test
+fn test_a_missing_repository_says_where_it_looked() [io]
+    test.case("the directory, so a person can see they are in the wrong one")
+    test.assert(GitNoRepository("/tmp/somewhere").message() != "")
+
+@test
+fn test_an_ambiguous_abbreviation_names_the_count() [io]
+    test.case("four objects begin with this prefix, and the message says four")
+    test.assert(GitAmbiguousOid("4bf92f3", 4).message() != "")
+
+    test.case("which is different from the object simply not being there")
+    test.assert(GitAmbiguousOid("4bf92f3", 4).message()
+                != GitObjectNotFound("4bf92f3").message())
+
+@test
+fn test_a_corrupt_object_carries_the_format_fault_that_found_it() [io]
+    test.case("the two error types meet here, so a caller handles one at the fs boundary")
+    let e = GitCorruptObject("e69de29", GitBadObjectHeader(0))
+    test.assert(e.message() != "")
+
+@test
+fn test_a_bad_gitdir_file_names_both_paths() [io]
+    test.case("the file, and what it pointed at — the worktree and submodule case")
+    test.assert(GitBadGitdirFile("/a/.git", "/b/nowhere").message() != "")
+
+@test
+fn test_a_read_failure_keeps_the_standard_librarys_own_error() [io]
+    test.case("so a caller can branch on it rather than on text")
+    let e = GitReadFailed("/a/.git/HEAD", IoNotFound)
+    test.assert(e.message() != "")
+
+@test
+fn test_every_fault_reads_as_something_different() [io]
+    test.case("a person told the wrong one of these looks in the wrong place")
+    test.assert(GitNoRepository("/a").message() != GitObjectNotFound("x").message())
+    test.assert(GitBadAlternate("/b").message() != GitNoRepository("/a").message())
+
+// The `[fs]` surface, named with the rows it declares.  These are
+// compiled rather than run: the assertion is that each signature is
+// callable at `[fs]` and no wider, which is what the module claims.
+fn find(here: Str) -> Result<Str, GitRepoFault> [fs]
+    gitrepo.discover(here)
+
+fn load(git_dir: Str) -> Result<GitRepo, GitRepoFault> [fs]
+    gitrepo.open(git_dir)
+
+fn here() -> Result<GitRepo, GitRepoFault> [fs]
+    gitrepo.open_from(".")
+
+fn one_object(r: GitRepo, o: GitOid) -> Result<GitObject, GitRepoFault> [fs]
+    gitrepo.read_object(r, o)
+
+fn about(r: GitRepo, o: GitOid) -> Result<(GitObjKind, Int), GitRepoFault> [fs]
+    gitrepo.object_info(r, o)
+
+fn present(r: GitRepo, o: GitOid) -> Bool [fs]
+    gitrepo.has_object(r, o)
+
+fn store(r: GitRepo, payload: Bytes) -> Result<GitOid, GitRepoFault> [fs]
+    gitrepo.write_object(r, GitKindBlob, payload)
+
+fn all_refs(r: GitRepo) -> Result<[GitRef], GitRepoFault> [fs]
+    gitrepo.refs(r)
+
+fn at_ref(r: GitRepo, name: Str) -> Result<?GitOid, GitRepoFault> [fs]
+    gitrepo.resolve_ref(r, name)
+
+fn move_ref(r: GitRepo, o: GitOid) -> Result<Unit, GitRepoFault> [fs]
+    gitrepo.write_ref(r, "refs/heads/main", o)
+
+fn staged(r: GitRepo) -> Result<GitLoadedIndex, GitRepoFault> [fs]
+    gitrepo.read_index(r)
+
+fn full_oid(r: GitRepo) -> Result<GitOid, GitRepoFault> [fs]
+    gitrepo.resolve_abbrev(r, "4bf92f3")
+
+fn short_oid(r: GitRepo, o: GitOid) -> Result<Str, GitRepoFault> [fs]
+    gitrepo.shortest_unique(r, o, 7)
+
+fn where_we_are(r: GitRepo) -> Result<GitHead, GitRepoFault> [fs]
+    gitrepo.head(r)
+
+fn history(r: GitRepo, tip: GitOid) -> Result<GitLogPage, GitRepoFault> [fs]
+    gitrepo.log(r, [tip], 50, None)
+
+fn tree_of(r: GitRepo, o: GitOid) -> Result<GitOid, GitRepoFault> [fs]
+    gitrepo.peel_to_tree(r, o)
+
+fn one_path(r: GitRepo, tree: GitOid) -> Result<?GitTreeEntry, GitRepoFault> [fs]
+    gitrepo.entry_at_path(r, tree, "src/main.nv")

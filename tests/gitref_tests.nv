@@ -1,0 +1,213 @@
+// gitref_tests.nv — the name rules, and the two sources that disagree.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-nv.gitref.<fn>`.
+//
+// THE TRAVERSAL CASE IS THE ONE THAT MATTERS.  A ref name becomes a path
+// under `.git`, and a fetch creates refs from names a stranger chose, so
+// `refs/heads/../../../etc/passwd` is a file write outside the
+// repository in any tool that skips the check.  Git's own
+// `check-ref-format` rules are a closed list and every one of them is a
+// case below.
+//
+// THE MERGE CASES ARE THE SECOND HALF.  A repository holds a ref in two
+// places after `git pack-refs`, the loose file wins, and an EMPTY loose
+// file is a deletion rather than an absence — a reader that concatenated
+// the two sources reports a branch at the commit before its last, and a
+// reader that skipped empty files reports a branch that no longer
+// exists.
+
+use std.test
+use std.list
+use gitobj
+use gitref
+
+fn an_oid() -> GitOid
+    gitobj.oid_of(GitKindBlob, bytes.from_str(""), GitSha1)
+
+fn a_ref(name: Str) -> GitRef
+    GitRef { name: name, target: GitRefDirect(an_oid()), peeled: None }
+
+@test
+fn test_an_ordinary_name_breaks_no_rule() [io]
+    test.case("a branch")
+    test.assert(list.len(gitref.check_ref_format("refs/heads/main")) == 0)
+
+    test.case("a tag with dots in it")
+    test.assert(list.len(gitref.check_ref_format("refs/tags/v1.2.0")) == 0)
+
+    test.case("and a remote-tracking branch")
+    test.assert(list.len(gitref.check_ref_format("refs/remotes/origin/main")) == 0)
+
+@test
+fn test_the_traversal_is_refused() [io]
+    test.case("a name containing .. is not a name")
+    test.assert(gitref.is_valid_name("refs/heads/../../../etc/passwd") == false)
+
+    test.case("and the refusal names the rule rather than saying invalid")
+    test.assert(list.len(gitref.check_ref_format("refs/heads/../x")) > 0)
+
+@test
+fn test_every_rule_git_has_is_a_rule_here() [io]
+    test.case("a component starting with a dot")
+    test.assert(gitref.is_valid_name("refs/heads/.hidden") == false)
+
+    test.case("a name ending in .lock, which collides with git's own lock file")
+    test.assert(gitref.is_valid_name("refs/heads/main.lock") == false)
+
+    test.case("a space")
+    test.assert(gitref.is_valid_name("refs/heads/my branch") == false)
+
+    test.case("one of the characters git reserves")
+    test.assert(gitref.is_valid_name("refs/heads/main~1") == false)
+    test.assert(gitref.is_valid_name("refs/heads/main^") == false)
+    test.assert(gitref.is_valid_name("refs/heads/main:x") == false)
+
+    test.case("the reflog syntax")
+    test.assert(gitref.is_valid_name("refs/heads/main@{1}") == false)
+
+    test.case("a double slash")
+    test.assert(gitref.is_valid_name("refs/heads//main") == false)
+
+    test.case("a trailing slash")
+    test.assert(gitref.is_valid_name("refs/heads/main/") == false)
+
+    test.case("and the bare at sign")
+    test.assert(gitref.is_valid_name("@") == false)
+
+@test
+fn test_a_name_breaking_three_rules_reports_three() [io]
+    test.case("a script-generated name usually breaks several at once")
+    test.assert(list.len(gitref.check_ref_format("refs/heads/../my branch.lock")) >= 2)
+
+@test
+fn test_the_loose_ref_wins_over_the_packed_one() [io]
+    let packed = GitPackedRefs { refs: [a_ref("refs/heads/main")],
+                                 fully_peeled: true, sorted: true }
+    let merged = gitref.merge_sources([a_ref("refs/heads/main")], packed)
+
+    test.case("one entry, not two")
+    test.assert(list.len(merged) == 1)
+
+@test
+fn test_a_packed_only_ref_survives_the_merge() [io]
+    let packed = GitPackedRefs { refs: [a_ref("refs/tags/v1.0.0")],
+                                 fully_peeled: true, sorted: true }
+
+    test.case("nothing loose to shadow it")
+    test.assert(list.len(gitref.merge_sources([], packed)) == 1)
+
+@test
+fn test_the_precedence_a_short_name_resolves_by() [io]
+    let refs = [a_ref("refs/heads/release"), a_ref("refs/tags/release")]
+
+    test.case("a tag beats a branch, which surprises people and is git's rule")
+    test.assert(gitref.expand(refs, "release") == Some("refs/tags/release"))
+
+    test.case("a full name expands to itself")
+    test.assert(gitref.expand(refs, "refs/heads/release") == Some("refs/heads/release"))
+
+    test.case("and a name nothing matches is None")
+    test.assert(gitref.expand(refs, "nothing") == None)
+
+@test
+fn test_a_symbolic_ref_is_followed() [io]
+    let refs = [GitRef { name: "HEAD",
+                         target: GitRefSymbolic("refs/heads/main"), peeled: None },
+                a_ref("refs/heads/main")]
+
+    test.case("HEAD resolves through to the commit")
+    match gitref.resolve(refs, "HEAD")
+        Some(o) => test.assert(gitobj.oid_is_null(o) == false)
+        None    => test.assert(false)
+
+@test
+fn test_an_unborn_branch_resolves_to_nothing_rather_than_failing() [io]
+    let refs = [GitRef { name: "HEAD",
+                         target: GitRefSymbolic("refs/heads/main"), peeled: None }]
+
+    test.case("a fresh repository's HEAD names a ref that is not there yet")
+    test.assert(gitref.resolve(refs, "HEAD") == None)
+
+@test
+fn test_the_three_namespace_predicates() [io]
+    test.case("a branch")
+    test.assert(gitref.is_branch("refs/heads/main"))
+    test.assert(gitref.is_tag("refs/heads/main") == false)
+
+    test.case("a tag")
+    test.assert(gitref.is_tag("refs/tags/v1.0.0"))
+
+    test.case("a remote-tracking branch")
+    test.assert(gitref.is_remote("refs/remotes/origin/main"))
+
+    test.case("and HEAD is none of the three, because it is not under refs/")
+    test.assert(gitref.is_branch(gitref.head_name()) == false)
+
+@test
+fn test_a_pattern_selects_a_namespace() [io]
+    let refs = [a_ref("refs/heads/main"), a_ref("refs/tags/v1.0.0"),
+                a_ref("refs/tags/v1.1.0")]
+
+    test.case("the tags, which is what a version resolver asks for")
+    test.assert(list.len(gitref.matching(refs, "refs/tags/*")) == 2)
+
+    test.case("and a full name selects exactly one")
+    test.assert(list.len(gitref.matching(refs, "refs/heads/main")) == 1)
+
+@test
+fn test_a_peeled_tag_answers_without_loading_anything() [io]
+    let peeled = GitRef { name: "refs/tags/v1.0.0",
+                          target: GitRefDirect(an_oid()), peeled: Some(an_oid()) }
+
+    test.case("the commit is right there")
+    test.assert(gitref.peeled_of(peeled) != None)
+
+    test.case("and a ref with none answers None, so the caller loads the object")
+    test.assert(gitref.peeled_of(a_ref("refs/tags/v1.0.0")) == None)
+
+@test
+fn test_a_ref_file_ends_with_a_newline() [io]
+    test.case("which git writes and half the tools that generate refs omit")
+    test.assert(str.ends_with(gitref.serialise_loose_ref(a_ref("refs/heads/main")), "\n"))
+
+@test
+fn test_a_loose_ref_file_parses_both_shapes() [io]
+    test.case("an id")
+    match gitref.parse_loose_ref("refs/heads/main",
+                                 "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n", GitSha1)
+        Ok(r)  => test.assert(r.name == "refs/heads/main")
+        Err(_) => test.assert(false)
+
+    test.case("and a symbolic ref")
+    match gitref.parse_loose_ref("HEAD", "ref: refs/heads/main\n", GitSha1)
+        Ok(r)  =>
+            match r.target
+                GitRefSymbolic(to) => test.assert(to == "refs/heads/main")
+                GitRefDirect(_)    => test.assert(false)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_packed_refs_file_reads_its_own_header() [io]
+    test.case("the capabilities line says whether an absent caret means not-a-tag")
+    match gitref.parse_packed_refs("# pack-refs with: peeled fully-peeled sorted\n",
+                                   GitSha1)
+        Ok(p)  =>
+            test.assert(p.fully_peeled)
+            test.assert(p.sorted)
+        Err(_) => test.assert(false)
+
+    test.case("and an old file without them says so rather than assuming")
+    match gitref.parse_packed_refs("", GitSha1)
+        Ok(p)  => test.assert(p.fully_peeled == false)
+        Err(_) => test.assert(false)
+
+@test
+fn test_shortening_answers_the_full_name_when_two_refs_collide() [io]
+    let refs = [a_ref("refs/heads/release"), a_ref("refs/tags/release")]
+
+    test.case("an unambiguous one shortens")
+    test.assert(gitref.shorten([a_ref("refs/heads/main")], "refs/heads/main") == "main")
+
+    test.case("and an ambiguous one keeps its full name rather than lying")
+    test.assert(gitref.shorten(refs, "refs/heads/release") == "refs/heads/release")
