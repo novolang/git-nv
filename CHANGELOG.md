@@ -5,6 +5,10 @@ All notable changes to git-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -52,3 +56,22 @@ The **interface**: every signature and every effect row, and no bodies.
   pointer and the IR fails to verify.
 - **No device claim.** `Bytes`, `Str` and `Result` are throughout.
 - **Three dependencies**, all `core`: crypto-nv, flate-nv, diff-nv.
+
+### Design notes
+
+- The `git-core-nv` split was published as a separate `core` package
+  rather than spelled inside this one. The alternative — `layer =
+  "core"` with `host_modules = ["gitrepo", "gitwork", "gitwire"]` —
+  would also have worked, and would have moved this package's cell on
+  the Orbit map away from where the must-have plan put it.
+- Replacing the `git` subprocess buys three things beyond removing a
+  dependency on a program being installed. `ls_refs` takes a ref
+  prefix, so resolving one tag out of a repository with fifty thousand
+  refs stops downloading all fifty thousand. The errors become values
+  with a status number on them, so a 404 and a 401 lead to different
+  messages rather than both being "git clone failed". And the resolver
+  stops shelling out, which makes it usable from a program that has no
+  shell.
+- `gitwork` holds functions that perform no input or output beside
+  functions that read files. The `host` layer permits that, and the
+  git-core-nv split separates them.

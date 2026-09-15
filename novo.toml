@@ -1,7 +1,7 @@
 [package]
 name        = "git-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Git plumbing without libgit2: the four object types to and from bytes under either hash, loose objects and packfiles with delta resolution as readers over ranges of a caller's bytes, refs and packed-refs, the index file, and the porcelain a tool needs — status, log, diff and blame — over the standard library's filesystem, with the smart HTTP protocol as a client.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could
